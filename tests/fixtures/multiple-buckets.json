@@ -1,0 +1,28 @@
+{
+  "id": 2,
+  "result": {
+    "rateLimits": {
+      "limitId": "fallback",
+      "primary": {
+        "usedPercent": 99,
+        "windowDurationMins": 60
+      }
+    },
+    "rateLimitsByLimitId": {
+      "codex_other": {
+        "limitId": "codex_other",
+        "primary": {
+          "usedPercent": 42,
+          "windowDurationMins": 60
+        }
+      },
+      "codex": {
+        "limitId": "codex",
+        "primary": {
+          "usedPercent": 7,
+          "windowDurationMins": 10080
+        }
+      }
+    }
+  }
+}

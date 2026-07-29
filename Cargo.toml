@@ -1,0 +1,31 @@
+[package]
+name = "codex-limits"
+version = "0.1.0"
+edition = "2024"
+authors = ["Emil Valdmanis"]
+description = "OpenDeck plugin for displaying Codex account limits"
+license = "MIT"
+repository = "https://github.com/EmilsValdmanis/codex-limits"
+readme = "README.md"
+keywords = ["codex", "opendeck", "stream-deck", "rate-limits"]
+categories = ["command-line-utilities"]
+
+[dependencies]
+base64 = "0.22"
+font8x8 = "0.3"
+log = "0.4"
+openaction = "2.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+simplelog = "0.12"
+thiserror = "2"
+tiny-skia = "0.11"
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true
