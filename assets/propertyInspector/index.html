@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Limits</title>
+    <link rel="stylesheet" href="sdpi.css" />
+  </head>
+  <body>
+    <div class="sdpi-wrapper">
+      <div class="sdpi-item">
+        <div class="sdpi-item-label">Account</div>
+        <select id="account" class="sdpi-item-value">
+          <option value="">Discovering accounts…</option>
+        </select>
+      </div>
+
+      <div class="sdpi-item">
+        <div class="sdpi-item-label"></div>
+        <button id="discover" class="sdpi-item-value" type="button">Refresh account list</button>
+      </div>
+
+      <div class="sdpi-item">
+        <div class="sdpi-item-label">Tile name</div>
+        <input
+          id="label"
+          class="sdpi-item-value"
+          type="text"
+          placeholder="My account"
+          autocomplete="off"
+        />
+      </div>
+
+      <div class="sdpi-item">
+        <div class="sdpi-item-label">Refresh</div>
+        <div class="sdpi-item-value field-with-suffix">
+          <input
+            id="refresh-minutes"
+            type="number"
+            min="1"
+            max="1440"
+            step="1"
+            value="5"
+          />
+          <span>minutes</span>
+        </div>
+      </div>
+
+      <details class="sdpi-details">
+        <summary>Advanced</summary>
+
+        <div class="sdpi-item">
+          <div class="sdpi-item-label">CODEX_HOME</div>
+          <input
+            id="codex-home"
+            class="sdpi-item-value"
+            type="text"
+            placeholder="~/.codex"
+            spellcheck="false"
+          />
+        </div>
+
+        <div class="sdpi-item">
+          <div class="sdpi-item-label">Executable</div>
+          <input
+            id="codex-executable"
+            class="sdpi-item-value"
+            type="text"
+            value="codex"
+            spellcheck="false"
+          />
+        </div>
+      </details>
+
+      <div class="sdpi-item">
+        <div class="sdpi-item-label"></div>
+        <button id="refresh" class="sdpi-item-value" type="button">Refresh now</button>
+      </div>
+
+      <div class="sdpi-item status-item" aria-live="polite">
+        <div class="sdpi-item-label">Status</div>
+        <div class="sdpi-item-value status-value">
+          <span id="connection-led" class="connection-led" title="Connecting"></span>
+          <span id="status-dot" class="status-dot"></span>
+          <span class="status-copy">
+            <span id="status-title">Connecting</span>
+            <small id="status-detail">Waiting for OpenDeck</small>
+          </span>
+        </div>
+      </div>
+    </div>
+    <script src="inspector.js"></script>
+  </body>
+</html>

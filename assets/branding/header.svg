@@ -1,0 +1,41 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title description">
+  <title id="title">Codex Limits</title>
+  <desc id="description">Codex Limits branding with the CL mark and quota bars</desc>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0c0f13"/>
+      <stop offset="1" stop-color="#151b22"/>
+    </linearGradient>
+    <linearGradient id="glow" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#3abe7e" stop-opacity=".24"/>
+      <stop offset="1" stop-color="#3abe7e" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="320" rx="28" fill="url(#background)"/>
+  <circle cx="1050" cy="28" r="250" fill="url(#glow)"/>
+
+  <g transform="translate(72 72)">
+    <rect width="176" height="176" rx="38" fill="#090c10" stroke="#29323b" stroke-width="3"/>
+    <path d="M35 44h63v17H52v54h46v17H35z" fill="#eaf0f4"/>
+    <path d="M109 44h17v71h31v17h-48z" fill="#eaf0f4"/>
+  </g>
+
+  <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
+    <text x="300" y="141" fill="#f0f4f7" font-size="68" font-weight="700" letter-spacing="-2">Codex Limits</text>
+    <text x="304" y="188" fill="#91a0ad" font-size="23" font-weight="500">Codex usage at a glance, directly on your Stream Deck.</text>
+  </g>
+
+  <g transform="translate(305 224)">
+    <rect width="184" height="10" rx="5" fill="#28313a"/>
+    <rect width="171" height="10" rx="5" fill="#3abe7e"/>
+    <rect x="208" width="184" height="10" rx="5" fill="#28313a"/>
+    <rect x="208" width="116" height="10" rx="5" fill="#eea43a"/>
+    <rect x="416" width="184" height="10" rx="5" fill="#28313a"/>
+    <rect x="416" width="38" height="10" rx="5" fill="#e84848"/>
+  </g>
+
+  <g transform="translate(1010 244)" fill="#91a0ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600" letter-spacing="2">
+    <text>OPENDECK</text>
+  </g>
+</svg>
