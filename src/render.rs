@@ -2,7 +2,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use font8x8::{BASIC_FONTS, UnicodeFonts};
-use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
+use tiny_skia::{
+    Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
+};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::model::{LimitWindow, ResetCredits};
@@ -77,10 +79,10 @@ pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
             if windows.is_empty() {
                 draw_centered(&mut pixmap, "NO LIMITS", 62, 2, color(129, 142, 154));
             } else if windows.len() == 1 {
-                draw_window(&mut pixmap, &windows[0], 43, true);
+                draw_window(&mut pixmap, &windows[0], 54);
             } else {
-                draw_window(&mut pixmap, &windows[0], 34, false);
-                draw_window(&mut pixmap, &windows[1], 73, false);
+                draw_window(&mut pixmap, &windows[0], 34);
+                draw_window(&mut pixmap, &windows[1], 73);
             }
 
             draw_reset_credits(&mut pixmap, reset_credits.as_ref(), unix_now());
@@ -122,30 +124,71 @@ fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: 
         116,
         2,
         1,
-        color(238, 164, 58),
+        reset_expiry_color(expires_at.saturating_sub(now)),
     );
 }
 
 fn draw_reset_icon(pixmap: &mut Pixmap, x: i32, y: i32, icon_color: Color) {
-    // A compact horizontal mirror of the familiar reset symbol: the arrowhead
-    // sits on the left and points left, while the open arc continues clockwise.
-    const LEFT_POINTING_RESET_ICON: [&str; 7] = [
-        "..###..", ".#...#.", "####..#", ".#....#", "..#...#", ".....#.", "..###..",
-    ];
+    // Keep the arrowhead tangential to the arc. A radial or open-corner tip
+    // becomes ambiguous at key resolution and can resemble a lowercase letter.
+    let x = x as f32;
+    let y = y as f32;
+    let mut arc = PathBuilder::new();
+    arc.move_to(x + 3.0, y + 10.0);
+    arc.cubic_to(x + 4.0, y + 14.0, x + 7.0, y + 15.0, x + 10.0, y + 14.0);
+    arc.cubic_to(x + 14.0, y + 13.0, x + 15.0, y + 9.0, x + 14.0, y + 6.0);
+    arc.cubic_to(x + 13.0, y + 2.0, x + 8.0, y + 1.0, x + 5.0, y + 3.0);
+    let Some(arc) = arc.finish() else {
+        return;
+    };
 
-    for (row, pixels) in LEFT_POINTING_RESET_ICON.iter().enumerate() {
-        for (column, pixel) in pixels.bytes().enumerate() {
-            if pixel == b'#' {
-                fill_rect(
-                    pixmap,
-                    (x + column as i32 * 2) as f32,
-                    (y + row as i32 * 2) as f32,
-                    2.0,
-                    2.0,
-                    icon_color,
-                );
-            }
-        }
+    let mut paint = Paint::default();
+    paint.set_color(icon_color);
+    paint.anti_alias = false;
+    let stroke = Stroke {
+        width: 2.0,
+        line_cap: LineCap::Square,
+        line_join: LineJoin::Miter,
+        ..Stroke::default()
+    };
+    pixmap.stroke_path(&arc, &paint, &stroke, Transform::identity(), None);
+
+    let mut arrowhead = PathBuilder::new();
+    arrowhead.move_to(x + 1.0, y + 7.0);
+    arrowhead.line_to(x + 3.0, y + 1.0);
+    arrowhead.line_to(x + 7.0, y + 5.0);
+    arrowhead.close();
+    if let Some(arrowhead) = arrowhead.finish() {
+        pixmap.fill_path(
+            &arrowhead,
+            &paint,
+            FillRule::Winding,
+            Transform::identity(),
+            None,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResetExpiryUrgency {
+    Healthy,
+    Warning,
+    Critical,
+}
+
+fn reset_expiry_urgency(remaining_seconds: i64) -> ResetExpiryUrgency {
+    match remaining_seconds {
+        ..=86_400 => ResetExpiryUrgency::Critical,
+        86_401..=604_800 => ResetExpiryUrgency::Warning,
+        _ => ResetExpiryUrgency::Healthy,
+    }
+}
+
+fn reset_expiry_color(remaining_seconds: i64) -> Color {
+    match reset_expiry_urgency(remaining_seconds) {
+        ResetExpiryUrgency::Healthy => color(58, 190, 126),
+        ResetExpiryUrgency::Warning => color(238, 164, 58),
+        ResetExpiryUrgency::Critical => color(232, 72, 72),
     }
 }
 
@@ -296,32 +339,69 @@ fn header_glyph(character: char) -> [u8; 7] {
         '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
         '<' => [0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001],
+        '~' => [0b00000, 0b00000, 0b01001, 0b10110, 0b00000, 0b00000, 0b00000],
+        '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0b00000],
+        'd' => [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101],
+        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
+        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
+        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
+        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
         ' ' => [0; 7],
         _ => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100],
     }
 }
 
-fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32, large: bool) {
+fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32) {
     let accent = quota_color(window.remaining_percent);
+    let mut label = window.label();
     let percentage = format!("{}%", window.remaining_percent);
-    let bar_y = if large {
-        draw_centered(pixmap, &window.label(), y - 9, 2, color(154, 167, 178));
-        draw_centered(pixmap, &percentage, y + 16, 3, color(238, 242, 245));
-        y + 50
+    let label_color = color(154, 167, 178);
+    let label_width = text_width(&label, 2);
+    let compact_label_width = compact_text_width(&label, 2, 1);
+    let mut percentage_width = text_width(&percentage, 2);
+    let mut percentage_x = WIDTH as i32 - 14 - percentage_width;
+    let use_compact_label = 14 + label_width + 6 > percentage_x;
+    let use_compact_percentage = use_compact_label && 14 + compact_label_width + 6 > percentage_x;
+
+    if use_compact_percentage {
+        percentage_width = compact_text_width(&percentage, 2, 1);
+        percentage_x = WIDTH as i32 - 14 - percentage_width;
+
+        let label_space = (percentage_x - 6 - 14).max(0);
+        let label_capacity = ((label_space + 1) / 11).max(1) as usize;
+        label = truncate_with_ellipsis(&label, label_capacity);
+    }
+
+    // Keep the duration and percentage on one baseline. Long future duration
+    // labels use the narrower tile alphabet at nearly the same cap height
+    // instead of shrinking the entire row.
+    if !use_compact_label {
+        draw_text(pixmap, &label, 14, y, 2, label_color);
     } else {
-        draw_text(pixmap, &window.label(), 14, y, 2, color(154, 167, 178));
-        let percentage_width = text_width(&percentage, 2);
+        draw_compact_text(pixmap, &label, 14, y + 1, 2, 1, label_color);
+    }
+    if use_compact_percentage {
+        draw_compact_text(
+            pixmap,
+            &percentage,
+            percentage_x,
+            y + 1,
+            2,
+            1,
+            color(238, 242, 245),
+        );
+    } else {
         draw_text(
             pixmap,
             &percentage,
-            WIDTH as i32 - 14 - percentage_width,
+            percentage_x,
             y,
             2,
             color(238, 242, 245),
         );
-        y + 23
-    };
+    }
 
+    let bar_y = y + 23;
     fill_rect(pixmap, 14.0, bar_y as f32, 116.0, 7.0, color(37, 44, 51));
     let width = 116.0 * f32::from(window.remaining_percent) / 100.0;
     if width > 0.0 {
@@ -517,5 +597,20 @@ mod tests {
         assert_eq!(reset_expiry_label(now + 7 * 3_600, now), "7h");
         assert_eq!(reset_expiry_label(now + 3_599, now), "<1h");
         assert_eq!(reset_expiry_label(now, now), "NOW");
+    }
+
+    #[test]
+    fn changes_reset_expiry_urgency_as_time_runs_out() {
+        assert_eq!(
+            reset_expiry_urgency(8 * 86_400),
+            ResetExpiryUrgency::Healthy
+        );
+        assert_eq!(
+            reset_expiry_urgency(7 * 86_400),
+            ResetExpiryUrgency::Warning
+        );
+        assert_eq!(reset_expiry_urgency(86_401), ResetExpiryUrgency::Warning);
+        assert_eq!(reset_expiry_urgency(86_400), ResetExpiryUrgency::Critical);
+        assert_eq!(reset_expiry_urgency(0), ResetExpiryUrgency::Critical);
     }
 }
