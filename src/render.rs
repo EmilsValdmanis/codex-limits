@@ -1,9 +1,11 @@
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use base64::Engine;
 use font8x8::{BASIC_FONTS, UnicodeFonts};
 use tiny_skia::{Color, Paint, Pixmap, Rect, Transform};
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::model::LimitWindow;
+use crate::model::{LimitWindow, ResetCredits};
 
 const WIDTH: u32 = 144;
 const HEIGHT: u32 = 144;
@@ -17,6 +19,7 @@ pub enum TileView {
     Limits {
         label: String,
         windows: Vec<LimitWindow>,
+        reset_credits: Option<ResetCredits>,
         refreshing: bool,
         stale: bool,
     },
@@ -66,18 +69,21 @@ pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
         }
         TileView::Limits {
             windows,
+            reset_credits,
             refreshing,
             stale,
             ..
         } => {
             if windows.is_empty() {
-                draw_centered(&mut pixmap, "NO LIMITS", 69, 2, color(129, 142, 154));
+                draw_centered(&mut pixmap, "NO LIMITS", 62, 2, color(129, 142, 154));
             } else if windows.len() == 1 {
-                draw_window(&mut pixmap, &windows[0], 53, true);
+                draw_window(&mut pixmap, &windows[0], 43, true);
             } else {
-                draw_window(&mut pixmap, &windows[0], 45, false);
-                draw_window(&mut pixmap, &windows[1], 94, false);
+                draw_window(&mut pixmap, &windows[0], 34, false);
+                draw_window(&mut pixmap, &windows[1], 73, false);
             }
+
+            draw_reset_credits(&mut pixmap, reset_credits.as_ref(), unix_now());
 
             if *refreshing {
                 fill_rect(&mut pixmap, 132.0, 10.0, 4.0, 4.0, color(65, 174, 255));
@@ -90,34 +96,139 @@ pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
     pixmap.encode_png().map_err(|error| error.to_string())
 }
 
+fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: i64) {
+    let (count, count_color) = match credits {
+        Some(credits) => (
+            credits.available_count.to_string(),
+            if credits.available_count > 0 {
+                color(65, 174, 255)
+            } else {
+                color(129, 142, 154)
+            },
+        ),
+        None => ("--".to_owned(), color(129, 142, 154)),
+    };
+    draw_reset_icon(pixmap, 14, 116, count_color);
+    draw_compact_text(pixmap, &count, 33, 116, 2, 1, count_color);
+
+    let Some(expires_at) = credits.and_then(|credits| credits.earliest_expires_at) else {
+        return;
+    };
+    let expiry = reset_expiry_label(expires_at, now).to_ascii_uppercase();
+    draw_compact_text(
+        pixmap,
+        &expiry,
+        WIDTH as i32 - 14 - compact_text_width(&expiry, 2, 1),
+        116,
+        2,
+        1,
+        color(238, 164, 58),
+    );
+}
+
+fn draw_reset_icon(pixmap: &mut Pixmap, x: i32, y: i32, icon_color: Color) {
+    // A compact horizontal mirror of the familiar reset symbol: the arrowhead
+    // sits on the left and points left, while the open arc continues clockwise.
+    const LEFT_POINTING_RESET_ICON: [&str; 7] = [
+        "..###..", ".#...#.", "####..#", ".#....#", "..#...#", ".....#.", "..###..",
+    ];
+
+    for (row, pixels) in LEFT_POINTING_RESET_ICON.iter().enumerate() {
+        for (column, pixel) in pixels.bytes().enumerate() {
+            if pixel == b'#' {
+                fill_rect(
+                    pixmap,
+                    (x + column as i32 * 2) as f32,
+                    (y + row as i32 * 2) as f32,
+                    2.0,
+                    2.0,
+                    icon_color,
+                );
+            }
+        }
+    }
+}
+
+fn reset_expiry_label(expires_at: i64, now: i64) -> String {
+    let remaining = expires_at.saturating_sub(now);
+    if remaining <= 0 {
+        return "NOW".to_owned();
+    }
+    if remaining < 3_600 {
+        return "<1h".to_owned();
+    }
+
+    let total_hours = remaining / 3_600;
+    let days = total_hours / 24;
+    let hours = total_hours % 24;
+    match (days, hours) {
+        (0, hours) => format!("{hours}h"),
+        (days, 0) => format!("{days}d"),
+        (days, hours) => format!("{days}d {hours}h"),
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
+}
+
 fn draw_header(pixmap: &mut Pixmap, label: &str) {
     const MAX_CHARACTERS: usize = 10;
-    const GLYPH_WIDTH: i32 = 10;
-    const SPACING: i32 = 1;
+    const SPACING: i32 = 3;
 
     let normalized = normalize_header_label(label);
     let label = truncate_with_ellipsis(&normalized, MAX_CHARACTERS);
-    let character_count = label.chars().count() as i32;
-    let width = character_count * GLYPH_WIDTH + (character_count - 1).max(0) * SPACING;
-    let mut cursor = (WIDTH as i32 - width) / 2;
+    let width = compact_text_width(&label, 2, SPACING);
+    draw_compact_text(
+        pixmap,
+        &label,
+        (WIDTH as i32 - width) / 2,
+        8,
+        2,
+        SPACING,
+        color(226, 232, 237),
+    );
+}
 
-    for character in label.chars() {
+fn compact_text_width(text: &str, scale: i32, spacing: i32) -> i32 {
+    let characters = text.chars().count() as i32;
+    if characters == 0 {
+        0
+    } else {
+        characters * 5 * scale + (characters - 1) * spacing
+    }
+}
+
+fn draw_compact_text(
+    pixmap: &mut Pixmap,
+    text: &str,
+    x: i32,
+    y: i32,
+    scale: i32,
+    spacing: i32,
+    text_color: Color,
+) {
+    let mut cursor = x;
+    for character in text.chars() {
         let glyph = header_glyph(character);
         for (row, bits) in glyph.iter().enumerate() {
             for column in 0..5 {
                 if bits & (1 << (4 - column)) != 0 {
                     fill_rect(
                         pixmap,
-                        (cursor + column * 2) as f32,
-                        (12 + row as i32 * 2) as f32,
-                        2.0,
-                        2.0,
-                        color(226, 232, 237),
+                        (cursor + column * scale) as f32,
+                        (y + row as i32 * scale) as f32,
+                        scale as f32,
+                        scale as f32,
+                        text_color,
                     );
                 }
             }
         }
-        cursor += GLYPH_WIDTH + SPACING;
+        cursor += 5 * scale + spacing;
     }
 }
 
@@ -184,6 +295,7 @@ fn header_glyph(character: char) -> [u8; 7] {
         '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
         '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
         '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
+        '<' => [0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001],
         ' ' => [0; 7],
         _ => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100],
     }
@@ -311,6 +423,13 @@ mod tests {
         }
     }
 
+    fn resets(count: u64, expires_at: Option<i64>) -> Option<ResetCredits> {
+        Some(ResetCredits {
+            available_count: count,
+            earliest_expires_at: expires_at,
+        })
+    }
+
     #[test]
     fn renders_all_tile_states_as_144_square_pngs() {
         let states = [
@@ -321,18 +440,21 @@ mod tests {
             TileView::Limits {
                 label: "CONTEXTIVO".into(),
                 windows: vec![window(93, 300), window(58, 10_080)],
+                reset_credits: resets(2, Some(unix_now() + 3 * 86_400 + 4 * 3_600)),
                 refreshing: false,
                 stale: false,
             },
             TileView::Limits {
-                label: "CUSTOM NAME".into(),
+                label: "PLUS".into(),
                 windows: vec![window(17, 43_800)],
+                reset_credits: resets(0, None),
                 refreshing: true,
                 stale: false,
             },
             TileView::Limits {
                 label: "RĪGA ACCOUNT".into(),
                 windows: vec![window(44, 10_080)],
+                reset_credits: None,
                 refreshing: false,
                 stale: true,
             },
@@ -364,6 +486,8 @@ mod tests {
     fn truncates_long_headers_with_an_ellipsis() {
         assert_eq!(truncate_with_ellipsis("CONTEXTIVO", 10), "CONTEXTIVO");
         assert_eq!(truncate_with_ellipsis("CODEX CONTEXTIVO", 10), "CODEX C...");
+        assert_eq!(compact_text_width("PLUS", 2, 3), 49);
+        assert!(compact_text_width("CONTEXTIVO", 2, 3) < WIDTH as i32);
     }
 
     #[test]
@@ -374,10 +498,24 @@ mod tests {
         let png = render_png(&TileView::Limits {
             label: "Rīga ĀŽ".into(),
             windows: vec![window(88, 10_080)],
+            reset_credits: resets(12, Some(unix_now() + 12 * 86_400 + 23 * 3_600)),
             refreshing: false,
             stale: false,
         })
         .unwrap();
         assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn formats_the_first_reset_expiry_as_days_and_hours() {
+        let now = 1_800_000_000;
+        assert_eq!(
+            reset_expiry_label(now + 3 * 86_400 + 4 * 3_600, now),
+            "3d 4h"
+        );
+        assert_eq!(reset_expiry_label(now + 2 * 86_400, now), "2d");
+        assert_eq!(reset_expiry_label(now + 7 * 3_600, now), "7h");
+        assert_eq!(reset_expiry_label(now + 3_599, now), "<1h");
+        assert_eq!(reset_expiry_label(now, now), "NOW");
     }
 }

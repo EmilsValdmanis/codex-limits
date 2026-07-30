@@ -64,6 +64,18 @@ pub struct LimitWindow {
     pub resets_at: Option<i64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResetCredits {
+    pub available_count: u64,
+    pub earliest_expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageSnapshot {
+    pub windows: Vec<LimitWindow>,
+    pub reset_credits: Option<ResetCredits>,
+}
+
 impl LimitWindow {
     fn from_wire(window: WireWindow) -> Self {
         let used = window.used_percent.clamp(0, 100) as u8;
@@ -104,14 +116,29 @@ struct WireSnapshot {
     secondary: Option<WireWindow>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireResetCredit {
+    status: Option<String>,
+    expires_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WireResetCredits {
+    available_count: Option<u64>,
+    credits: Option<Vec<WireResetCredit>>,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireResponse {
     rate_limits: Option<WireSnapshot>,
     rate_limits_by_limit_id: Option<HashMap<String, WireSnapshot>>,
+    rate_limit_reset_credits: Option<WireResetCredits>,
 }
 
-pub fn normalize_rate_limits(value: &Value) -> Result<Vec<LimitWindow>, NormalizeError> {
+pub fn normalize_usage_snapshot(value: &Value) -> Result<UsageSnapshot, NormalizeError> {
     let result = value.get("result").unwrap_or(value);
     let wire: WireResponse = serde_json::from_value(result.clone())
         .map_err(|error| NormalizeError::InvalidResponse(error.to_string()))?;
@@ -146,7 +173,41 @@ pub fn normalize_rate_limits(value: &Value) -> Result<Vec<LimitWindow>, Normaliz
         windows.push(last);
     }
 
-    Ok(windows)
+    let reset_credits = wire.rate_limit_reset_credits.and_then(|summary| {
+        summary.available_count.map(|available_count| {
+            let earliest_expires_at = (available_count > 0)
+                .then(|| {
+                    summary.credits.as_deref().and_then(|credits| {
+                        credits
+                            .iter()
+                            .filter(|credit| {
+                                credit
+                                    .status
+                                    .as_deref()
+                                    .is_none_or(|status| status == "available")
+                            })
+                            .filter_map(|credit| credit.expires_at)
+                            .min()
+                    })
+                })
+                .flatten();
+
+            ResetCredits {
+                available_count,
+                earliest_expires_at,
+            }
+        })
+    });
+
+    Ok(UsageSnapshot {
+        windows,
+        reset_credits,
+    })
+}
+
+#[cfg(test)]
+pub fn normalize_rate_limits(value: &Value) -> Result<Vec<LimitWindow>, NormalizeError> {
+    normalize_usage_snapshot(value).map(|snapshot| snapshot.windows)
 }
 
 pub fn duration_label(duration_minutes: Option<u64>) -> String {
@@ -286,5 +347,76 @@ mod tests {
         assert_eq!(windows.len(), 1);
         assert_eq!(windows[0].label(), "12h");
         assert_eq!(windows[0].remaining_percent, 70);
+    }
+
+    #[test]
+    fn parses_authoritative_reset_count_and_earliest_available_expiry() {
+        let value = fixture(
+            r#"{
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {"usedPercent": 25, "windowDurationMins": 300}
+                },
+                "rateLimitResetCredits": {
+                    "availableCount": 4,
+                    "credits": [
+                        {"status": "available", "expiresAt": 1784246400},
+                        {"status": "redeemed", "expiresAt": 1781000000},
+                        {"status": "available", "expiresAt": 1781654400}
+                    ]
+                }
+            }"#,
+        );
+        let snapshot = normalize_usage_snapshot(&value).unwrap();
+        assert_eq!(
+            snapshot.reset_credits,
+            Some(ResetCredits {
+                available_count: 4,
+                earliest_expires_at: Some(1_781_654_400),
+            })
+        );
+    }
+
+    #[test]
+    fn distinguishes_unknown_reset_details_from_no_reset_summary() {
+        let count_only = fixture(
+            r#"{
+                "rateLimits": {"limitId": "codex"},
+                "rateLimitResetCredits": {"availableCount": 2, "credits": null}
+            }"#,
+        );
+        assert_eq!(
+            normalize_usage_snapshot(&count_only).unwrap().reset_credits,
+            Some(ResetCredits {
+                available_count: 2,
+                earliest_expires_at: None,
+            })
+        );
+
+        let empty = fixture(
+            r#"{
+                "rateLimits": {"limitId": "codex"},
+                "rateLimitResetCredits": {
+                    "availableCount": 0,
+                    "credits": [{"status": "available", "expiresAt": 1784246400}]
+                }
+            }"#,
+        );
+        assert_eq!(
+            normalize_usage_snapshot(&empty).unwrap().reset_credits,
+            Some(ResetCredits {
+                available_count: 0,
+                earliest_expires_at: None,
+            })
+        );
+
+        let unavailable =
+            fixture(r#"{"rateLimits": {"limitId": "codex"}, "rateLimitResetCredits": null}"#);
+        assert_eq!(
+            normalize_usage_snapshot(&unavailable)
+                .unwrap()
+                .reset_credits,
+            None
+        );
     }
 }

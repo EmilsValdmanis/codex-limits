@@ -1,42 +1,59 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 390" role="img" aria-labelledby="title description">
   <title id="title">Codex Limits tile preview</title>
-  <desc id="description">Three Stream Deck tiles showing weekly and monthly Codex quota</desc>
+  <desc id="description">Three Stream Deck tiles showing Codex quota, earned reset counts, and the next reset expiry</desc>
   <rect width="1000" height="390" rx="24" fill="#202327"/>
 
   <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" text-anchor="middle">
     <g transform="translate(95 50)">
       <rect width="250" height="250" rx="42" fill="#0c0f13" stroke="#3b4045" stroke-width="5"/>
-      <text x="125" y="49" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="3">PERSONAL</text>
-      <text x="48" y="100" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
-      <text x="199" y="100" fill="#eef2f5" font-size="31" font-weight="700">93%</text>
-      <rect x="25" y="120" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="120" width="186" height="12" fill="#3abe7e"/>
-      <text x="48" y="179" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
-      <text x="199" y="179" fill="#eef2f5" font-size="31" font-weight="700">58%</text>
-      <rect x="25" y="199" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="199" width="116" height="12" fill="#3abe7e"/>
+      <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">PERSONAL</text>
+      <text x="48" y="82" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
+      <text x="199" y="82" fill="#eef2f5" font-size="31" font-weight="700">93%</text>
+      <rect x="25" y="100" width="200" height="12" fill="#252c33"/>
+      <rect x="25" y="100" width="186" height="12" fill="#3abe7e"/>
+      <text x="48" y="150" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
+      <text x="199" y="150" fill="#eef2f5" font-size="31" font-weight="700">58%</text>
+      <rect x="25" y="168" width="200" height="12" fill="#252c33"/>
+      <rect x="25" y="168" width="116" height="12" fill="#3abe7e"/>
+      <g transform="translate(25 201) scale(1.3)" fill="none" stroke="#41aeff" stroke-width="2.5" stroke-linecap="square" stroke-linejoin="miter">
+        <path d="M7 3a7 7 0 1 1-4 6"/>
+        <path d="M2 3v6h6"/>
+      </g>
+      <text x="52" y="225" text-anchor="start" fill="#41aeff" font-size="22" font-weight="700">2</text>
+      <text x="225" y="225" text-anchor="end" fill="#eea43a" font-size="20" font-weight="700">3d 4h</text>
     </g>
 
     <g transform="translate(375 50)">
       <rect width="250" height="250" rx="42" fill="#0c0f13" stroke="#3b4045" stroke-width="5"/>
-      <text x="125" y="49" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="3">TEAM</text>
-      <text x="125" y="111" fill="#9aa7b2" font-size="29" font-weight="700">~30d</text>
-      <text x="125" y="174" fill="#eef2f5" font-size="54" font-weight="700">83%</text>
-      <rect x="25" y="202" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="202" width="166" height="12" fill="#3abe7e"/>
+      <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">TEAM</text>
+      <text x="125" y="78" fill="#9aa7b2" font-size="29" font-weight="700">~30d</text>
+      <text x="125" y="143" fill="#eef2f5" font-size="54" font-weight="700">83%</text>
+      <rect x="25" y="162" width="200" height="12" fill="#252c33"/>
+      <rect x="25" y="162" width="166" height="12" fill="#3abe7e"/>
+      <g transform="translate(25 201) scale(1.3)" fill="none" stroke="#818e9a" stroke-width="2.5" stroke-linecap="square" stroke-linejoin="miter">
+        <path d="M7 3a7 7 0 1 1-4 6"/>
+        <path d="M2 3v6h6"/>
+      </g>
+      <text x="52" y="225" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">0</text>
     </g>
 
     <g transform="translate(655 50)">
       <rect width="250" height="250" rx="42" fill="#0c0f13" stroke="#3b4045" stroke-width="5"/>
-      <text x="125" y="49" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="3">WORK</text>
-      <text x="48" y="100" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
-      <text x="199" y="100" fill="#eef2f5" font-size="31" font-weight="700">44%</text>
-      <rect x="25" y="120" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="120" width="88" height="12" fill="#eea43a"/>
-      <text x="48" y="179" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
-      <text x="199" y="179" fill="#eef2f5" font-size="31" font-weight="700">17%</text>
-      <rect x="25" y="199" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="199" width="34" height="12" fill="#e84848"/>
+      <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">WORK</text>
+      <text x="48" y="82" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
+      <text x="199" y="82" fill="#eef2f5" font-size="31" font-weight="700">44%</text>
+      <rect x="25" y="100" width="200" height="12" fill="#252c33"/>
+      <rect x="25" y="100" width="88" height="12" fill="#eea43a"/>
+      <text x="48" y="150" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
+      <text x="199" y="150" fill="#eef2f5" font-size="31" font-weight="700">17%</text>
+      <rect x="25" y="168" width="200" height="12" fill="#252c33"/>
+      <rect x="25" y="168" width="34" height="12" fill="#e84848"/>
+      <g transform="translate(25 201) scale(1.3)" fill="none" stroke="#41aeff" stroke-width="2.5" stroke-linecap="square" stroke-linejoin="miter">
+        <path d="M7 3a7 7 0 1 1-4 6"/>
+        <path d="M2 3v6h6"/>
+      </g>
+      <text x="52" y="225" text-anchor="start" fill="#41aeff" font-size="22" font-weight="700">1</text>
+      <text x="225" y="225" text-anchor="end" fill="#eea43a" font-size="20" font-weight="700">18h</text>
     </g>
   </g>
 
