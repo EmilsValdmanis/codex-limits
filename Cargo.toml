@@ -11,7 +11,7 @@ keywords = ["codex", "opendeck", "stream-deck", "rate-limits"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 font8x8 = "0.3"
 log = "0.4"
 openaction = "2.7"
