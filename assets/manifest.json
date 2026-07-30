@@ -2,7 +2,7 @@
   "Name": "Codex Limits",
   "Description": "Display Codex account limits and refresh them from a Stream Deck key",
   "Author": "Emil Valdmanis",
-  "Version": "0.2.0",
+  "Version": "0.2.1",
   "CodePaths": {
     "x86_64-unknown-linux-gnu": "x86_64-unknown-linux-gnu/bin/codex-limits"
   },

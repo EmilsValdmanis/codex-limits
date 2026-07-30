@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.0" src="https://img.shields.io/badge/version-0.2.0-3abe7e">
+  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-3abe7e">
   <img alt="Linux x86_64" src="https://img.shields.io/badge/platform-Linux%20x86__64-596674">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-e36b35">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-596674"></a>
@@ -15,14 +15,15 @@ Assign one `CODEX_HOME` per key, let the plugin refresh in the background, and
 press a key whenever you want a fresh reading.
 
 <p align="center">
-  <img src="assets/branding/tiles.svg" alt="Three Codex Limits key layouts showing weekly and monthly quota" width="820">
+  <img src="assets/branding/tiles.svg" alt="Three Codex Limits key layouts showing weekly and monthly quota with urgency-colored reset expiry times" width="820">
 </p>
 
 ## Highlights
 
 - Multiple Codex accounts, configured independently per key
 - Dynamic 5-hour, 7-day, monthly, and future window labels
-- Earned reset count and a live countdown to the first reset expiry
+- Side-by-side limit duration and percentage rows at every window size
+- Earned reset count and an urgency-colored countdown to the first reset expiry
 - Shared in-memory cache and one in-flight request per account
 - Configurable polling from 1 minute to 24 hours
 - Immediate refresh on key press, with success or failure feedback
@@ -90,9 +91,10 @@ uses the authoritative available count and the earliest available expiry. It
 does not start a model turn.
 
 The bottom strip shows a left-pointing circular reset icon followed by `2` for
-two available resets. Its amber value (for example, `3d 4h`) is the time until
-the first one expires. `--` beside the icon means the account service did not
-provide reset information; it is distinct from `0`.
+two available resets. The value on the right (for example, `3d 4h`) is the time
+until the first one expires; it changes from green to amber at seven days, then
+red at 24 hours. `--` beside the icon means the account service did not provide
+reset information; it is distinct from `0`.
 
 Visible keys sharing the same canonical `CODEX_HOME` and executable share a
 single cache entry. The shortest configured interval wins, concurrent requests
