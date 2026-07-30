@@ -9,7 +9,7 @@ use serde::Serialize;
 use tokio::sync::{Mutex, oneshot};
 
 use crate::app_server::{AppServerClient, AppServerError};
-use crate::model::{LimitWindow, TileSettings};
+use crate::model::{TileSettings, UsageSnapshot};
 use crate::render::{TileView, render_data_uri};
 
 const POLL_RESOLUTION: Duration = Duration::from_secs(5);
@@ -43,7 +43,7 @@ struct Subscription {
 
 #[derive(Default)]
 struct CacheEntry {
-    limits: Option<Vec<LimitWindow>>,
+    snapshot: Option<UsageSnapshot>,
     last_success: Option<SystemTime>,
     last_attempt: Option<Instant>,
     error: Option<AppServerError>,
@@ -220,8 +220,8 @@ impl AccountManager {
                 cache.refreshing = false;
 
                 let waiter_result = match result {
-                    Ok(limits) => {
-                        cache.limits = Some(limits);
+                    Ok(snapshot) => {
+                        cache.snapshot = Some(snapshot);
                         cache.last_success = Some(SystemTime::now());
                         cache.error = None;
                         Ok(())
@@ -358,8 +358,8 @@ impl AccountManager {
             )),
             Some(cache) => {
                 let refreshed_at = cache.last_success.and_then(unix_seconds);
-                match (&cache.limits, &cache.error) {
-                    (Some(limits), error) => {
+                match (&cache.snapshot, &cache.error) {
+                    (Some(snapshot), error) => {
                         let stale = error.is_some();
                         let message = if cache.refreshing {
                             "Refreshing".to_owned()
@@ -378,7 +378,8 @@ impl AccountManager {
                         Some((
                             TileView::Limits {
                                 label,
-                                windows: limits.clone(),
+                                windows: snapshot.windows.clone(),
+                                reset_credits: snapshot.reset_credits.clone(),
                                 refreshing: cache.refreshing,
                                 stale,
                             },

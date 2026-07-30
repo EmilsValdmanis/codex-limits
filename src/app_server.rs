@@ -10,7 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::time::timeout;
 
-use crate::model::{LimitWindow, NormalizeError, normalize_rate_limits};
+use crate::model::{NormalizeError, UsageSnapshot, normalize_usage_snapshot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const STDERR_LIMIT: usize = 8 * 1024;
@@ -73,9 +73,9 @@ impl AppServerClient {
         }
     }
 
-    pub async fn fetch_limits(&self) -> Result<Vec<LimitWindow>, AppServerError> {
+    pub async fn fetch_limits(&self) -> Result<UsageSnapshot, AppServerError> {
         let value = self.request("account/rateLimits/read", 2, None).await?;
-        normalize_rate_limits(&value).map_err(|error| match error {
+        normalize_usage_snapshot(&value).map_err(|error| match error {
             NormalizeError::MissingSnapshot => AppServerError::EmptyRateLimits,
             NormalizeError::InvalidResponse(message) => AppServerError::Protocol(message),
         })
@@ -329,7 +329,7 @@ IFS= read -r initialized
 IFS= read -r request
 case "$request" in
   *account/rateLimits/read*)
-    printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300},"secondary":{"usedPercent":34,"windowDurationMins":10080}}}}'
+    printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300},"secondary":{"usedPercent":34,"windowDurationMins":10080}},"rateLimitResetCredits":{"availableCount":2,"credits":[{"status":"available","expiresAt":1784246400}]}}}'
     ;;
   *account/read*)
     printf '%s\n' '{"id":3,"result":{"account":{"type":"chatgpt","email":"test@example.com","planType":"plus"},"requiresOpenaiAuth":true}}'
@@ -367,10 +367,11 @@ esac
         let executable = fake_codex(directory.path());
         let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
 
-        let limits = client.fetch_limits().await.unwrap();
-        assert_eq!(limits.len(), 2);
-        assert_eq!(limits[0].remaining_percent, 88);
-        assert_eq!(limits[1].remaining_percent, 66);
+        let snapshot = client.fetch_limits().await.unwrap();
+        assert_eq!(snapshot.windows.len(), 2);
+        assert_eq!(snapshot.windows[0].remaining_percent, 88);
+        assert_eq!(snapshot.windows[1].remaining_percent, 66);
+        assert_eq!(snapshot.reset_credits.unwrap().available_count, 2);
     }
 
     #[tokio::test]
@@ -427,10 +428,10 @@ esac
     #[ignore = "requires a signed-in local CODEX_HOME and real Codex CLI"]
     async fn reads_live_rate_limits() {
         let home = std::env::var("CODEX_HOME").expect("set CODEX_HOME for this test");
-        let limits = AppServerClient::new("codex", home)
+        let snapshot = AppServerClient::new("codex", home)
             .fetch_limits()
             .await
             .unwrap();
-        assert!(limits.len() <= 2);
+        assert!(snapshot.windows.len() <= 2);
     }
 }
