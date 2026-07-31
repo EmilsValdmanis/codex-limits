@@ -219,7 +219,7 @@ pub fn duration_label(duration_minutes: Option<u64>) -> String {
         if minutes % 1_440 == 0 {
             return format!("{}d", minutes / 1_440);
         }
-        return format!("~{}d", (minutes as f64 / 1_440.0).round() as u64);
+        return format!("{}d", (minutes as f64 / 1_440.0).round() as u64);
     }
 
     if minutes >= 60 {
@@ -267,7 +267,7 @@ mod tests {
     fn formats_durations() {
         assert_eq!(duration_label(Some(300)), "5h");
         assert_eq!(duration_label(Some(10_080)), "7d");
-        assert_eq!(duration_label(Some(43_800)), "~30d");
+        assert_eq!(duration_label(Some(43_800)), "30d");
         assert_eq!(duration_label(Some(45)), "45m");
         assert_eq!(duration_label(None), "Limit");
     }
@@ -306,7 +306,7 @@ mod tests {
         let value = fixture(include_str!("../tests/fixtures/single-30d.json"));
         let windows = normalize_rate_limits(&value).unwrap();
         assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label(), "~30d");
+        assert_eq!(windows[0].label(), "30d");
         assert_eq!(windows[0].remaining_percent, 83);
     }
 

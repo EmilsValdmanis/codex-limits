@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.2.1" src="https://img.shields.io/badge/version-0.2.1-3abe7e">
+  <img alt="Version 0.2.2" src="https://img.shields.io/badge/version-0.2.2-3abe7e">
   <img alt="Linux x86_64" src="https://img.shields.io/badge/platform-Linux%20x86__64-596674">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-e36b35">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-596674"></a>
