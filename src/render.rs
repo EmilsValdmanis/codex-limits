@@ -11,6 +11,8 @@ use crate::model::{LimitWindow, ResetCredits};
 
 const WIDTH: u32 = 144;
 const HEIGHT: u32 = 144;
+const FOOTER_TEXT_Y: i32 = 116;
+const FOOTER_ICON_Y: i32 = FOOTER_TEXT_Y - 1;
 
 #[derive(Clone, Debug)]
 pub enum TileView {
@@ -110,8 +112,8 @@ fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: 
         ),
         None => ("--".to_owned(), color(129, 142, 154)),
     };
-    draw_reset_icon(pixmap, 14, 116, count_color);
-    draw_compact_text(pixmap, &count, 33, 116, 2, 1, count_color);
+    draw_reset_icon(pixmap, 14, FOOTER_ICON_Y, count_color);
+    draw_compact_text(pixmap, &count, 33, FOOTER_TEXT_Y, 2, 1, count_color);
 
     let Some(expires_at) = credits.and_then(|credits| credits.earliest_expires_at) else {
         return;
@@ -121,7 +123,7 @@ fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: 
         pixmap,
         &expiry,
         WIDTH as i32 - 14 - compact_text_width(&expiry, 2, 1),
-        116,
+        FOOTER_TEXT_Y,
         2,
         1,
         reset_expiry_color(expires_at.saturating_sub(now)),
@@ -612,5 +614,28 @@ mod tests {
         assert_eq!(reset_expiry_urgency(86_401), ResetExpiryUrgency::Warning);
         assert_eq!(reset_expiry_urgency(86_400), ResetExpiryUrgency::Critical);
         assert_eq!(reset_expiry_urgency(0), ResetExpiryUrgency::Critical);
+    }
+
+    #[test]
+    fn aligns_the_reset_icon_with_the_footer_text() {
+        fn occupied_y_bounds(pixmap: &Pixmap) -> (u32, u32) {
+            let occupied_rows = (0..pixmap.height()).filter(|&y| {
+                let row_start = (y * pixmap.width() * 4) as usize;
+                pixmap.data()[row_start..row_start + (pixmap.width() * 4) as usize]
+                    .chunks_exact(4)
+                    .any(|pixel| pixel[3] != 0)
+            });
+
+            let rows = occupied_rows.collect::<Vec<_>>();
+            (*rows.first().unwrap(), *rows.last().unwrap())
+        }
+
+        let mut icon = Pixmap::new(24, 24).unwrap();
+        draw_reset_icon(&mut icon, 4, 3, color(65, 174, 255));
+
+        let mut count = Pixmap::new(24, 24).unwrap();
+        draw_compact_text(&mut count, "2", 4, 4, 2, 1, color(65, 174, 255));
+
+        assert_eq!(occupied_y_bounds(&icon), occupied_y_bounds(&count));
     }
 }
