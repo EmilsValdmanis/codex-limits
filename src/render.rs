@@ -78,16 +78,17 @@ pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
             stale,
             ..
         } => {
+            let now = unix_now();
             if windows.is_empty() {
                 draw_centered(&mut pixmap, "NO LIMITS", 62, 2, color(129, 142, 154));
             } else if windows.len() == 1 {
-                draw_window(&mut pixmap, &windows[0], 54);
+                draw_window(&mut pixmap, &windows[0], 45, now);
             } else {
-                draw_window(&mut pixmap, &windows[0], 34);
-                draw_window(&mut pixmap, &windows[1], 73);
+                draw_window(&mut pixmap, &windows[0], 27, now);
+                draw_window(&mut pixmap, &windows[1], 70, now);
             }
 
-            draw_reset_credits(&mut pixmap, reset_credits.as_ref(), unix_now());
+            draw_reset_credits(&mut pixmap, reset_credits.as_ref(), now);
 
             if *refreshing {
                 fill_rect(&mut pixmap, 132.0, 10.0, 4.0, 4.0, color(65, 174, 255));
@@ -118,7 +119,7 @@ fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: 
     let Some(expires_at) = credits.and_then(|credits| credits.earliest_expires_at) else {
         return;
     };
-    let expiry = reset_expiry_label(expires_at, now).to_ascii_uppercase();
+    let expiry = countdown_label(expires_at, now).to_ascii_uppercase();
     draw_compact_text(
         pixmap,
         &expiry,
@@ -194,8 +195,8 @@ fn reset_expiry_color(remaining_seconds: i64) -> Color {
     }
 }
 
-fn reset_expiry_label(expires_at: i64, now: i64) -> String {
-    let remaining = expires_at.saturating_sub(now);
+fn countdown_label(target_at: i64, now: i64) -> String {
+    let remaining = target_at.saturating_sub(now);
     if remaining <= 0 {
         return "NOW".to_owned();
     }
@@ -353,7 +354,7 @@ fn header_glyph(character: char) -> [u8; 7] {
     }
 }
 
-fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32) {
+fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32, now: i64) {
     let accent = quota_color(window.remaining_percent);
     let mut label = window.label();
     let percentage = format!("{}%", window.remaining_percent);
@@ -403,12 +404,31 @@ fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32) {
         );
     }
 
-    let bar_y = y + 23;
+    let bar_y = y + 18;
     fill_rect(pixmap, 14.0, bar_y as f32, 116.0, 7.0, color(37, 44, 51));
     let width = 116.0 * f32::from(window.remaining_percent) / 100.0;
     if width > 0.0 {
         fill_rect(pixmap, 14.0, bar_y as f32, width, 7.0, accent);
     }
+
+    // Keep organic reset timing at the same physical type size as the primary
+    // values. A short "IN" cue leaves room for days and hours without falling
+    // back to the 1px glyphs that blur on a Stream Deck display.
+    let reset_y = y + 27;
+    let reset_time = window
+        .resets_at
+        .map(|resets_at| countdown_label(resets_at, now).to_ascii_uppercase())
+        .unwrap_or_else(|| "--".to_owned());
+    draw_compact_text(pixmap, "IN", 14, reset_y, 2, 1, color(129, 142, 154));
+    draw_compact_text(
+        pixmap,
+        &reset_time,
+        WIDTH as i32 - 14 - compact_text_width(&reset_time, 2, 1),
+        reset_y,
+        2,
+        1,
+        color(193, 203, 211),
+    );
 }
 
 fn quota_color(remaining: u8) -> Color {
@@ -505,6 +525,13 @@ mod tests {
         }
     }
 
+    fn window_reset(remaining: u8, duration: u64, resets_in: i64) -> LimitWindow {
+        LimitWindow {
+            resets_at: Some(unix_now() + resets_in),
+            ..window(remaining, duration)
+        }
+    }
+
     fn resets(count: u64, expires_at: Option<i64>) -> Option<ResetCredits> {
         Some(ResetCredits {
             available_count: count,
@@ -521,14 +548,17 @@ mod tests {
             },
             TileView::Limits {
                 label: "CONTEXTIVO".into(),
-                windows: vec![window(93, 300), window(58, 10_080)],
+                windows: vec![
+                    window_reset(93, 300, 4 * 3_600),
+                    window_reset(58, 10_080, 2 * 86_400 + 7 * 3_600),
+                ],
                 reset_credits: resets(2, Some(unix_now() + 3 * 86_400 + 4 * 3_600)),
                 refreshing: false,
                 stale: false,
             },
             TileView::Limits {
                 label: "PLUS".into(),
-                windows: vec![window(17, 43_800)],
+                windows: vec![window_reset(17, 43_800, 18 * 86_400 + 9 * 3_600)],
                 reset_credits: resets(0, None),
                 refreshing: true,
                 stale: false,
@@ -573,6 +603,13 @@ mod tests {
     }
 
     #[test]
+    fn keeps_the_largest_practical_reset_countdown_at_full_type_size() {
+        let cue_right = 14 + compact_text_width("IN", 2, 1);
+        let countdown_left = WIDTH as i32 - 14 - compact_text_width("999D 23H", 2, 1);
+        assert!(cue_right < countdown_left);
+    }
+
+    #[test]
     fn transliterates_unicode_headers_before_drawing() {
         assert_eq!(normalize_header_label("Pēteris"), "PETERIS");
         assert_eq!(normalize_header_label("Crème Brûlée"), "CREME BRULEE");
@@ -589,16 +626,13 @@ mod tests {
     }
 
     #[test]
-    fn formats_the_first_reset_expiry_as_days_and_hours() {
+    fn formats_reset_countdowns_as_days_and_hours() {
         let now = 1_800_000_000;
-        assert_eq!(
-            reset_expiry_label(now + 3 * 86_400 + 4 * 3_600, now),
-            "3d 4h"
-        );
-        assert_eq!(reset_expiry_label(now + 2 * 86_400, now), "2d");
-        assert_eq!(reset_expiry_label(now + 7 * 3_600, now), "7h");
-        assert_eq!(reset_expiry_label(now + 3_599, now), "<1h");
-        assert_eq!(reset_expiry_label(now, now), "NOW");
+        assert_eq!(countdown_label(now + 3 * 86_400 + 4 * 3_600, now), "3d 4h");
+        assert_eq!(countdown_label(now + 2 * 86_400, now), "2d");
+        assert_eq!(countdown_label(now + 7 * 3_600, now), "7h");
+        assert_eq!(countdown_label(now + 3_599, now), "<1h");
+        assert_eq!(countdown_label(now, now), "NOW");
     }
 
     #[test]

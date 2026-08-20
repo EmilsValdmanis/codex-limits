@@ -1,8 +1,8 @@
 {
   "Name": "Codex Limits",
-  "Description": "Display Codex account limits and refresh them from a Stream Deck key",
+  "Description": "Display Codex account limits and organic reset timing on a Stream Deck key",
   "Author": "Emil Valdmanis",
-  "Version": "0.2.2",
+  "Version": "0.3.0",
   "CodePaths": {
     "x86_64-unknown-linux-gnu": "x86_64-unknown-linux-gnu/bin/codex-limits"
   },
@@ -27,7 +27,7 @@
         "Keypad"
       ],
       "SupportedInMultiActions": false,
-      "Tooltip": "Display and refresh limits for one Codex account",
+      "Tooltip": "Display limits and organic reset timing for one Codex account",
       "UUID": "com.emilsvaldmanis.codexlimits.account",
       "PropertyInspectorPath": "propertyInspector/index.html"
     }

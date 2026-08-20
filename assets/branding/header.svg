@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" role="img" aria-labelledby="title description">
   <title id="title">Codex Limits</title>
-  <desc id="description">Codex Limits branding with the CL mark and quota bars</desc>
+  <desc id="description">Codex Limits branding with the CL mark, quota bars, and reset timing</desc>
   <defs>
     <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
       <stop offset="0" stop-color="#0c0f13"/>
@@ -23,7 +23,7 @@
 
   <g font-family="Inter, ui-sans-serif, system-ui, sans-serif">
     <text x="300" y="141" fill="#f0f4f7" font-size="68" font-weight="700" letter-spacing="-2">Codex Limits</text>
-    <text x="304" y="188" fill="#91a0ad" font-size="23" font-weight="500">Codex usage at a glance, directly on your Stream Deck.</text>
+    <text x="304" y="188" fill="#91a0ad" font-size="23" font-weight="500">Quota and reset timing, directly on your Stream Deck.</text>
   </g>
 
   <g transform="translate(305 224)">
@@ -35,7 +35,13 @@
     <rect x="416" width="38" height="10" rx="5" fill="#e84848"/>
   </g>
 
-  <g transform="translate(1010 244)" fill="#91a0ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600" letter-spacing="2">
+  <g fill="#81909d" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" font-weight="700" letter-spacing=".5">
+    <text x="305" y="259">IN 4H</text>
+    <text x="513" y="259">IN 2D 7H</text>
+    <text x="721" y="259">IN 18D 9H</text>
+  </g>
+
+  <g transform="translate(1010 272)" fill="#91a0ad" font-family="Inter, ui-sans-serif, system-ui, sans-serif" font-size="15" font-weight="600" letter-spacing="2">
     <text>OPENDECK</text>
   </g>
 </svg>

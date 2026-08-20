@@ -1,9 +1,9 @@
 [package]
 name = "codex-limits"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["Emil Valdmanis"]
-description = "OpenDeck plugin for displaying Codex account limits"
+description = "OpenDeck plugin for displaying Codex limits and reset timing"
 license = "MIT"
 repository = "https://github.com/EmilsValdmanis/codex-limits"
 readme = "README.md"
