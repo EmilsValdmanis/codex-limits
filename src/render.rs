@@ -201,7 +201,7 @@ fn countdown_label(target_at: i64, now: i64) -> String {
         return "NOW".to_owned();
     }
     if remaining < 3_600 {
-        return "<1h".to_owned();
+        return format!("{}m", (remaining / 60).max(1));
     }
 
     let total_hours = remaining / 3_600;
@@ -626,12 +626,14 @@ mod tests {
     }
 
     #[test]
-    fn formats_reset_countdowns_as_days_and_hours() {
+    fn formats_reset_countdowns_as_days_hours_and_minutes() {
         let now = 1_800_000_000;
         assert_eq!(countdown_label(now + 3 * 86_400 + 4 * 3_600, now), "3d 4h");
         assert_eq!(countdown_label(now + 2 * 86_400, now), "2d");
         assert_eq!(countdown_label(now + 7 * 3_600, now), "7h");
-        assert_eq!(countdown_label(now + 3_599, now), "<1h");
+        assert_eq!(countdown_label(now + 3_599, now), "59m");
+        assert_eq!(countdown_label(now + 60, now), "1m");
+        assert_eq!(countdown_label(now + 1, now), "1m");
         assert_eq!(countdown_label(now, now), "NOW");
     }
 
@@ -656,8 +658,10 @@ mod tests {
             let occupied_rows = (0..pixmap.height()).filter(|&y| {
                 let row_start = (y * pixmap.width() * 4) as usize;
                 pixmap.data()[row_start..row_start + (pixmap.width() * 4) as usize]
-                    .chunks_exact(4)
-                    .any(|pixel| pixel[3] != 0)
+                    .iter()
+                    .skip(3)
+                    .step_by(4)
+                    .any(|alpha| *alpha != 0)
             });
 
             let rows = occupied_rows.collect::<Vec<_>>();
