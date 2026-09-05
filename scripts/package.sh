@@ -9,7 +9,7 @@ stage_dir="$dist_dir/$plugin_name"
 archive="$dist_dir/com.emilsvaldmanis.codexlimits.streamDeckPlugin"
 binary="$repo_root/target/release/codex-limits"
 
-cargo build --release --manifest-path "$repo_root/Cargo.toml"
+cargo build --release --locked --manifest-path "$repo_root/Cargo.toml"
 
 case "$stage_dir" in
   "$repo_root"/dist/*.sdPlugin) ;;

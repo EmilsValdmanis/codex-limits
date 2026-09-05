@@ -8,11 +8,13 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 
 use crate::model::{NormalizeError, UsageSnapshot, normalize_usage_snapshot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
 const STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -138,7 +140,9 @@ impl AppServerClient {
             })?;
 
         let stderr = child.stderr.take().expect("piped stderr");
-        let stderr_task = tokio::spawn(read_stderr_tail(stderr));
+        // Dropping the set also cancels the reader if this request is cancelled.
+        let mut stderr_tasks = JoinSet::new();
+        stderr_tasks.spawn(read_stderr_tail(stderr));
 
         let result = timeout(request_timeout, exchange(&mut child, method, id, params)).await;
 
@@ -148,7 +152,12 @@ impl AppServerClient {
         };
 
         cleanup_child(&mut child).await;
-        let stderr = stderr_task.await.unwrap_or_default();
+        // A descendant can retain stderr after the app-server exits. Diagnostics
+        // must not keep a completed or timed-out request waiting indefinitely.
+        let stderr = match timeout(STDERR_DRAIN_TIMEOUT, stderr_tasks.join_next()).await {
+            Ok(Some(Ok(stderr))) => stderr,
+            _ => String::new(),
+        };
 
         response.map_err(|error| match error {
             AppServerError::ProcessExited(message) if !stderr.is_empty() => {
@@ -401,6 +410,54 @@ esac
         assert!(tail.len() <= STDERR_LIMIT);
         assert!(!tail.contains("discard-this-prefix"));
         assert!(tail.ends_with("keep-this-suffix"));
+    }
+
+    #[tokio::test]
+    async fn inherited_stderr_does_not_block_a_successful_response() {
+        let directory = tempfile::tempdir().unwrap();
+        let executable = fake_codex(directory.path());
+        let script = std::fs::read_to_string(&executable).unwrap();
+        std::fs::write(
+            &executable,
+            script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 2 &\n", 1),
+        )
+        .unwrap();
+        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
+
+        let snapshot = timeout(Duration::from_secs(1), client.fetch_limits())
+            .await
+            .expect("an inherited stderr pipe must not block the response")
+            .unwrap();
+        assert_eq!(snapshot.windows[0].remaining_percent, 88);
+    }
+
+    #[tokio::test]
+    async fn inherited_stderr_does_not_block_a_timeout() {
+        let directory = tempfile::tempdir().unwrap();
+        let (executable, pid_file) = hanging_codex(directory.path());
+        let script = std::fs::read_to_string(&executable).unwrap();
+        std::fs::write(
+            &executable,
+            script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 2 &\n", 1),
+        )
+        .unwrap();
+        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
+
+        let error = timeout(
+            Duration::from_secs(1),
+            client.request_with_timeout(
+                "account/rateLimits/read",
+                2,
+                None,
+                Duration::from_millis(300),
+            ),
+        )
+        .await
+        .expect("an inherited stderr pipe must not defeat the request timeout")
+        .unwrap_err();
+        assert_eq!(error, AppServerError::Timeout);
+        let pid = std::fs::read_to_string(pid_file).unwrap();
+        assert!(!Path::new("/proc").join(pid.trim()).exists());
     }
 
     #[tokio::test]

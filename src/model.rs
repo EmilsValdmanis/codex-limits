@@ -42,6 +42,7 @@ impl TileSettings {
 
         let directory = self
             .codex_home
+            .trim()
             .trim_end_matches('/')
             .rsplit('/')
             .next()
@@ -140,19 +141,16 @@ struct WireResponse {
 
 pub fn normalize_usage_snapshot(value: &Value) -> Result<UsageSnapshot, NormalizeError> {
     let result = value.get("result").unwrap_or(value);
-    let wire: WireResponse = serde_json::from_value(result.clone())
+    let wire = WireResponse::deserialize(result)
         .map_err(|error| NormalizeError::InvalidResponse(error.to_string()))?;
 
     let snapshot = wire
         .rate_limits_by_limit_id
-        .as_ref()
-        .and_then(|buckets| buckets.get("codex").cloned())
-        .or_else(|| {
-            wire.rate_limits_by_limit_id.as_ref().and_then(|buckets| {
+        .and_then(|mut buckets| {
+            buckets.remove("codex").or_else(|| {
                 buckets
-                    .values()
+                    .into_values()
                     .find(|bucket| bucket.limit_id.as_deref() == Some("codex"))
-                    .cloned()
             })
         })
         .or(wire.rate_limits)
@@ -165,13 +163,10 @@ pub fn normalize_usage_snapshot(value: &Value) -> Result<UsageSnapshot, Normaliz
         .collect();
 
     windows.sort_by_key(|window| window.duration_minutes.unwrap_or(u64::MAX));
-    windows.dedup_by_key(|window| window.duration_minutes);
-
-    if windows.len() > 2 {
-        let last = windows.pop().expect("length checked");
-        windows.truncate(1);
-        windows.push(last);
-    }
+    // Missing durations do not establish that two windows are duplicates.
+    windows.dedup_by(|left, right| {
+        left.duration_minutes.is_some() && left.duration_minutes == right.duration_minutes
+    });
 
     let reset_credits = wire.rate_limit_reset_credits.and_then(|summary| {
         summary.available_count.map(|available_count| {
@@ -259,6 +254,9 @@ mod tests {
         };
         assert_eq!(settings.effective_label(), "codex_contextivo");
 
+        settings.codex_home = "  /home/emil/.codex_contextivo/  ".into();
+        assert_eq!(settings.effective_label(), "codex_contextivo");
+
         settings.label = "PLUS".into();
         assert_eq!(settings.effective_label(), "PLUS");
     }
@@ -289,6 +287,47 @@ mod tests {
         let windows = normalize_rate_limits(&value).unwrap();
         assert_eq!(windows[0].used_percent, 7);
         assert_eq!(windows[0].label(), "7d");
+    }
+
+    #[test]
+    fn preserves_windows_with_unknown_durations() {
+        let value = fixture(
+            r#"{"rateLimits": {
+                "primary": {"usedPercent": 10},
+                "secondary": {"usedPercent": 80}
+            }}"#,
+        );
+        let windows = normalize_rate_limits(&value).unwrap();
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].remaining_percent, 90);
+        assert_eq!(windows[1].remaining_percent, 20);
+    }
+
+    #[test]
+    fn deduplicates_windows_with_matching_known_durations() {
+        let value = fixture(
+            r#"{"rateLimits": {
+                "primary": {"usedPercent": 10, "windowDurationMins": 300},
+                "secondary": {"usedPercent": 10, "windowDurationMins": 300}
+            }}"#,
+        );
+        assert_eq!(normalize_rate_limits(&value).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn finds_codex_by_limit_id_when_the_bucket_key_differs() {
+        let value = fixture(
+            r#"{
+                "rateLimits": {"primary": {"usedPercent": 90}},
+                "rateLimitsByLimitId": {
+                    "other-key": {"limitId": "codex", "primary": {"usedPercent": 10}}
+                }
+            }"#,
+        );
+        assert_eq!(
+            normalize_rate_limits(&value).unwrap()[0].remaining_percent,
+            90
+        );
     }
 
     #[test]

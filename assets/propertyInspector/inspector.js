@@ -11,6 +11,7 @@ let settings = {
 };
 let saveTimer;
 let lastSuggestedLabel = "";
+let discoveryQueued = false;
 
 const elements = {};
 
@@ -39,6 +40,8 @@ function connectElgatoStreamDeckSocket(
   });
   socket.addEventListener("message", handleMessage);
   socket.addEventListener("close", () => {
+    discoveryQueued = false;
+    elements.discover.classList.remove("is-busy");
     elements.connectionLed.classList.remove("is-online");
     setStatus("error", "Disconnected", "OpenDeck closed the inspector connection");
   });
@@ -113,6 +116,12 @@ function handleMessage(event) {
 
   const payload = message.payload || {};
   if (payload.event === "accountsDiscovered") {
+    elements.discover.classList.remove("is-busy");
+    if (discoveryQueued) {
+      discoveryQueued = false;
+      requestAccounts();
+      return;
+    }
     renderAccounts(payload.accounts || []);
   } else if (payload.event === "status") {
     const detail = payload.refreshedAt
@@ -155,7 +164,6 @@ function renderAccounts(accounts) {
       saveSettings();
     }
   }
-  elements.discover.classList.remove("is-busy");
 }
 
 function selectCurrentHome() {
@@ -173,6 +181,7 @@ function scheduleSave() {
 }
 
 function saveSettings() {
+  clearTimeout(saveTimer);
   if (!socket || socket.readyState !== WebSocket.OPEN) return;
   settings = {
     codexHome: elements.codexHome.value.trim(),
@@ -191,7 +200,11 @@ function saveSettings() {
 }
 
 function requestAccounts() {
-  if (elements.discover.classList.contains("is-busy")) return;
+  if (!socket || socket.readyState !== WebSocket.OPEN) return;
+  if (elements.discover.classList.contains("is-busy")) {
+    discoveryQueued = true;
+    return;
+  }
   elements.discover.classList.add("is-busy");
   sendToPlugin({ event: "discoverAccounts" });
 }

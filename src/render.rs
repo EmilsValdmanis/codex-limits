@@ -259,21 +259,8 @@ fn draw_compact_text(
 ) {
     let mut cursor = x;
     for character in text.chars() {
-        let glyph = header_glyph(character);
-        for (row, bits) in glyph.iter().enumerate() {
-            for column in 0..5 {
-                if bits & (1 << (4 - column)) != 0 {
-                    fill_rect(
-                        pixmap,
-                        (cursor + column * scale) as f32,
-                        (y + row as i32 * scale) as f32,
-                        scale as f32,
-                        scale as f32,
-                        text_color,
-                    );
-                }
-            }
-        }
+        let glyph = header_glyph(character).map(|row| row.reverse_bits() >> 3);
+        draw_glyph(pixmap, &glyph, cursor, y, scale, text_color);
         cursor += 5 * scale + spacing;
     }
 }
@@ -480,21 +467,37 @@ fn draw_text(pixmap: &mut Pixmap, text: &str, x: i32, y: i32, scale: i32, text_c
             .get(character)
             .or_else(|| BASIC_FONTS.get('?'))
             .unwrap_or([0; 8]);
-        for (row, bits) in glyph.iter().enumerate() {
-            for column in 0..8 {
-                if bits & (1 << column) != 0 {
-                    fill_rect(
-                        pixmap,
-                        (cursor + column * scale) as f32,
-                        (glyph_y + row as i32 * scale) as f32,
-                        scale as f32,
-                        scale as f32,
-                        text_color,
-                    );
-                }
+        draw_glyph(pixmap, &glyph, cursor, glyph_y, scale, text_color);
+        cursor += 9 * scale;
+    }
+}
+
+// Both bitmap fonts use opaque, integer-aligned cells. Write those pixels
+// directly; paths and fractional quota bars still use tiny-skia's rasterizer.
+// Rows are encoded least-significant bit first, matching font8x8.
+fn draw_glyph(pixmap: &mut Pixmap, glyph: &[u8], x: i32, y: i32, scale: i32, fill: Color) {
+    debug_assert_eq!(fill.alpha(), 1.0);
+    debug_assert!(scale > 0);
+    let width = pixmap.width() as i32;
+    let height = pixmap.height() as i32;
+    let pixel = fill.premultiply().to_color_u8();
+    let pixels = pixmap.pixels_mut();
+
+    for (row, bits) in glyph.iter().enumerate() {
+        let top = y + row as i32 * scale;
+        let bottom = (top + scale).clamp(0, height);
+        for column in 0..8 {
+            if bits & (1 << column) == 0 {
+                continue;
+            }
+            let left = x + column * scale;
+            let right = (left + scale).clamp(0, width) as usize;
+            let left = left.clamp(0, width) as usize;
+            for row in top.max(0)..bottom {
+                let offset = row as usize * width as usize;
+                pixels[offset + left..offset + right].fill(pixel);
             }
         }
-        cursor += 9 * scale;
     }
 }
 
@@ -539,9 +542,8 @@ mod tests {
         })
     }
 
-    #[test]
-    fn renders_all_tile_states_as_144_square_pngs() {
-        let states = [
+    fn tile_states() -> [TileView; 6] {
+        [
             TileView::Unconfigured,
             TileView::Loading {
                 label: "PERSONAL".into(),
@@ -574,7 +576,33 @@ mod tests {
                 label: "OITG".into(),
                 message: "Offline".into(),
             },
-        ];
+        ]
+    }
+
+    #[test]
+    #[ignore = "manual release-mode performance measurement"]
+    fn benchmark_rendering() {
+        let states = tile_states();
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..200 {
+                for state in &states {
+                    std::hint::black_box(render_data_uri(std::hint::black_box(state)).unwrap());
+                }
+            }
+            samples.push(start.elapsed().as_nanos() / (200 * states.len()) as u128);
+        }
+        samples.sort_unstable();
+        println!(
+            "render + PNG + base64: {} ns/tile (median of 7 samples)",
+            samples[3]
+        );
+    }
+
+    #[test]
+    fn renders_all_tile_states_as_144_square_pngs() {
+        let states = tile_states();
 
         let preview_directory =
             std::env::var_os("CODEX_LIMITS_RENDER_DIR").map(std::path::PathBuf::from);
@@ -590,6 +618,60 @@ mod tests {
             assert_eq!(image.height(), HEIGHT);
             if let Some(directory) = &preview_directory {
                 std::fs::write(directory.join(format!("tile-{index}.png")), png).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn bitmap_rasterization_matches_tiny_skia_including_clipped_cells() {
+        let glyph = [0, 1, 0x80, 0xff, 0x55, 0xaa, 0x18, 0];
+        let foreground = color(65, 174, 255);
+        for scale in [1, 2, 4] {
+            for x in [-32, -3, 0, 10, 23, 32] {
+                for y in [-32, -3, 0, 10, 23, 32] {
+                    let mut actual = Pixmap::new(24, 24).unwrap();
+                    actual.fill(color(12, 15, 19));
+                    let mut expected = actual.clone();
+                    draw_glyph(&mut actual, &glyph, x, y, scale, foreground);
+                    for (row, bits) in glyph.iter().enumerate() {
+                        for column in 0..8 {
+                            if bits & (1 << column) != 0 {
+                                // Clip before invoking the reference rasterizer:
+                                // its rounding can paint an extra edge pixel for
+                                // rectangles ending at coordinate zero.
+                                let left = (x + column * scale).max(0);
+                                let top = (y + row as i32 * scale).max(0);
+                                let right = (x + (column + 1) * scale).min(24);
+                                let bottom = (y + (row as i32 + 1) * scale).min(24);
+                                if right <= left || bottom <= top {
+                                    continue;
+                                }
+                                fill_rect(
+                                    &mut expected,
+                                    left as f32,
+                                    top as f32,
+                                    (right - left) as f32,
+                                    (bottom - top) as f32,
+                                    foreground,
+                                );
+                            }
+                        }
+                    }
+                    let mismatch = actual
+                        .pixels()
+                        .iter()
+                        .zip(expected.pixels())
+                        .position(|(left, right)| left != right);
+                    assert!(
+                        mismatch.is_none(),
+                        "x={x}, y={y}, scale={scale}, mismatch={:?}",
+                        mismatch.map(|index| (
+                            index,
+                            actual.pixels()[index],
+                            expected.pixels()[index]
+                        ))
+                    );
+                }
             }
         }
     }
