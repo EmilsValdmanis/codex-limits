@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -15,23 +14,10 @@ use crate::render::{TileView, render_data_uri};
 const POLL_RESOLUTION: Duration = Duration::from_secs(5);
 const IMAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(4);
 
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AccountKey {
     pub codex_home: PathBuf,
     pub executable: String,
-}
-
-impl PartialEq for AccountKey {
-    fn eq(&self, other: &Self) -> bool {
-        self.codex_home == other.codex_home && self.executable == other.executable
-    }
-}
-
-impl Hash for AccountKey {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.codex_home.hash(state);
-        self.executable.hash(state);
-    }
 }
 
 #[derive(Clone)]
@@ -113,6 +99,7 @@ impl AccountManager {
     }
 
     pub async fn subscribe(self: &Arc<Self>, instance_id: String, settings: TileSettings) {
+        let interval = refresh_interval(&settings);
         let key_result = account_key(&settings);
         let (key, setup_error) = match key_result {
             Ok(key) => (Some(key), None),
@@ -124,7 +111,7 @@ impl AccountManager {
             state.subscriptions.insert(
                 instance_id.clone(),
                 Subscription {
-                    settings: settings.clone(),
+                    settings,
                     key: key.clone(),
                     setup_error,
                 },
@@ -132,10 +119,10 @@ impl AccountManager {
 
             key.as_ref().is_some_and(|key| {
                 let cache = state.caches.entry(key.clone()).or_default();
-                cache.last_attempt.is_none()
-                    || cache
+                !cache.refreshing
+                    && cache
                         .last_attempt
-                        .is_some_and(|last| last.elapsed() >= refresh_interval(&settings))
+                        .is_none_or(|last| last.elapsed() >= interval)
             })
         };
 
@@ -189,14 +176,20 @@ impl AccountManager {
                 cache.error = None;
             }
 
-            let instance_ids = subscribers_for_key(&state, &key);
+            let instance_ids = if should_start {
+                subscribers_for_key(&state, &key)
+            } else {
+                Vec::new()
+            };
             (receiver, should_start, instance_ids)
         };
 
         if should_start {
-            self.render_instances(instance_ids).await;
             let manager = self.clone();
             tokio::spawn(async move {
+                // Start the owned task before yielding so cancellation of a
+                // caller cannot leave the account permanently refreshing.
+                manager.render_instances(instance_ids).await;
                 manager.perform_refresh(key).await;
             });
         }
@@ -245,10 +238,10 @@ impl AccountManager {
 
     async fn due_keys(&self) -> Vec<AccountKey> {
         let state = self.state.lock().await;
-        let mut intervals: HashMap<AccountKey, Duration> = HashMap::new();
+        let mut intervals: HashMap<&AccountKey, Duration> = HashMap::new();
 
         for subscription in state.subscriptions.values() {
-            let Some(key) = subscription.key.clone() else {
+            let Some(key) = subscription.key.as_ref() else {
                 continue;
             };
             let interval = refresh_interval(&subscription.settings);
@@ -261,14 +254,14 @@ impl AccountManager {
         intervals
             .into_iter()
             .filter_map(|(key, interval)| {
-                let cache = state.caches.get(&key);
+                let cache = state.caches.get(key);
                 let due = cache.is_none_or(|cache| {
                     !cache.refreshing
                         && cache
                             .last_attempt
                             .is_none_or(|last| last.elapsed() >= interval)
                 });
-                due.then_some(key)
+                due.then(|| key.clone())
             })
             .collect()
     }
@@ -582,6 +575,145 @@ printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","primary":{{
         right.unwrap();
         wait_for_count(&counter, 2).await;
         assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release-mode performance measurement"]
+    async fn benchmark_polling() {
+        let manager = AccountManager::new();
+        {
+            let mut state = manager.state.lock().await;
+            for index in 0..32 {
+                let key = AccountKey {
+                    codex_home: PathBuf::from(format!("/synthetic/account-{}", index % 4)),
+                    executable: "codex".into(),
+                };
+                state
+                    .caches
+                    .entry(key.clone())
+                    .or_insert_with(|| CacheEntry {
+                        last_attempt: Some(Instant::now()),
+                        ..CacheEntry::default()
+                    });
+                state.subscriptions.insert(
+                    index.to_string(),
+                    Subscription {
+                        settings: TileSettings::default(),
+                        key: Some(key),
+                        setup_error: None,
+                    },
+                );
+            }
+        }
+        let mut samples = Vec::new();
+        for _ in 0..7 {
+            let start = Instant::now();
+            for _ in 0..10_000 {
+                std::hint::black_box(manager.due_keys().await);
+            }
+            samples.push(start.elapsed().as_nanos() / 10_000);
+        }
+        samples.sort_unstable();
+        println!(
+            "poll 32 tiles / 4 accounts: {} ns/pass (median of 7 samples)",
+            samples[3]
+        );
+    }
+
+    #[tokio::test]
+    async fn polling_uses_the_shortest_visible_interval_and_skips_in_flight_accounts() {
+        let manager = AccountManager::new();
+        let key = AccountKey {
+            codex_home: PathBuf::from("/synthetic/home"),
+            executable: "codex".into(),
+        };
+        {
+            let mut state = manager.state.lock().await;
+            for (instance_id, refresh_minutes) in [("fast", 1), ("slow", 5)] {
+                state.subscriptions.insert(
+                    instance_id.into(),
+                    Subscription {
+                        settings: TileSettings {
+                            refresh_minutes,
+                            ..TileSettings::default()
+                        },
+                        key: Some(key.clone()),
+                        setup_error: None,
+                    },
+                );
+            }
+            state.caches.insert(
+                key.clone(),
+                CacheEntry {
+                    last_attempt: Some(Instant::now() - Duration::from_secs(120)),
+                    ..CacheEntry::default()
+                },
+            );
+        }
+
+        assert_eq!(manager.due_keys().await, vec![key.clone()]);
+        manager
+            .state
+            .lock()
+            .await
+            .caches
+            .get_mut(&key)
+            .unwrap()
+            .refreshing = true;
+        assert!(manager.due_keys().await.is_empty());
+        manager
+            .state
+            .lock()
+            .await
+            .caches
+            .get_mut(&key)
+            .unwrap()
+            .refreshing = false;
+
+        manager.unsubscribe("fast").await;
+        assert!(manager.due_keys().await.is_empty());
+        manager
+            .state
+            .lock()
+            .await
+            .caches
+            .get_mut(&key)
+            .unwrap()
+            .last_attempt = None;
+        assert_eq!(manager.due_keys().await, vec![key]);
+        manager.unsubscribe("slow").await;
+        assert!(manager.due_keys().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiter_does_not_cancel_the_shared_refresh() {
+        let directory = tempfile::tempdir().unwrap();
+        let (executable, counter) = counting_codex(directory.path());
+        let manager = AccountManager::new();
+        let key = AccountKey {
+            codex_home: directory.path().to_owned(),
+            executable: executable.to_string_lossy().into_owned(),
+        };
+
+        // Poll once to start the worker, then drop the caller at its first wait.
+        let mut request = Box::pin(manager.refresh_key(key.clone()));
+        std::future::poll_fn(|context| {
+            assert!(request.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(request);
+
+        tokio::time::timeout(Duration::from_secs(2), manager.refresh_key(key.clone()))
+            .await
+            .expect("the shared worker should finish after its caller is cancelled")
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "1");
+        let state = manager.state.lock().await;
+        let cache = state.caches.get(&key).unwrap();
+        assert!(!cache.refreshing);
+        assert!(cache.snapshot.is_some());
+        assert!(cache.waiters.is_empty());
     }
 
     #[tokio::test]
