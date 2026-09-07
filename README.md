@@ -93,7 +93,8 @@ does not start a model turn.
 
 Each quota row includes its normal service reset beneath the usage bar. For
 example, `IN 2d 7h` means that quota refreshes organically in two days and
-seven hours, while `IN 42m` means it refreshes in 42 minutes. `IN --` means
+seven hours, `IN 4h 59m` means four hours and 59 minutes, and `IN 42m`
+means it refreshes in 42 minutes. `IN --` means
 Codex did not provide a reset timestamp. Reset timing uses the same
 device-readable type size as the main quota values.
 
