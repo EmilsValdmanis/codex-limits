@@ -2,7 +2,7 @@
   "Name": "Codex Limits",
   "Description": "Display Codex account limits and organic reset timing on a Stream Deck key",
   "Author": "Emil Valdmanis",
-  "Version": "0.3.2",
+  "Version": "0.3.3",
   "CodePaths": {
     "x86_64-unknown-linux-gnu": "x86_64-unknown-linux-gnu/bin/codex-limits"
   },

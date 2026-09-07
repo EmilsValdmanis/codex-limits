@@ -207,7 +207,9 @@ fn countdown_label(target_at: i64, now: i64) -> String {
     let total_hours = remaining / 3_600;
     let days = total_hours / 24;
     let hours = total_hours % 24;
+    let minutes = (remaining / 60) % 60;
     match (days, hours) {
+        (0, hours) if minutes > 0 => format!("{hours}h {minutes}m"),
         (0, hours) => format!("{hours}h"),
         (days, 0) => format!("{days}d"),
         (days, hours) => format!("{days}d {hours}h"),
@@ -687,8 +689,13 @@ mod tests {
     #[test]
     fn keeps_the_largest_practical_reset_countdown_at_full_type_size() {
         let cue_right = 14 + compact_text_width("IN", 2, 1);
-        let countdown_left = WIDTH as i32 - 14 - compact_text_width("999D 23H", 2, 1);
-        assert!(cue_right < countdown_left);
+        for label in ["999D 23H", "23H 59M", "4H 59M"] {
+            let countdown_left = WIDTH as i32 - 14 - compact_text_width(label, 2, 1);
+            assert!(
+                cue_right < countdown_left,
+                "countdown overlaps cue: {label}"
+            );
+        }
     }
 
     #[test]
@@ -713,6 +720,12 @@ mod tests {
         assert_eq!(countdown_label(now + 3 * 86_400 + 4 * 3_600, now), "3d 4h");
         assert_eq!(countdown_label(now + 2 * 86_400, now), "2d");
         assert_eq!(countdown_label(now + 7 * 3_600, now), "7h");
+        assert_eq!(countdown_label(now + 5 * 3_600, now), "5h");
+        assert_eq!(countdown_label(now + 5 * 3_600 - 1, now), "4h 59m");
+        assert_eq!(countdown_label(now + 3_660, now), "1h 1m");
+        assert_eq!(countdown_label(now + 3_600, now), "1h");
+        assert_eq!(countdown_label(now + 86_399, now), "23h 59m");
+        assert_eq!(countdown_label(now + 86_400, now), "1d");
         assert_eq!(countdown_label(now + 3_599, now), "59m");
         assert_eq!(countdown_label(now + 60, now), "1m");
         assert_eq!(countdown_label(now + 1, now), "1m");
