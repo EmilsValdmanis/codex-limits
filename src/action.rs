@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 
 use crate::account_manager::AccountManager;
 use crate::discovery::discover_accounts;
-use crate::model::TileSettings;
+use crate::settings::{DEFAULT_EXECUTABLE, TileSettings};
 
 pub struct CodexLimitsAction {
     manager: Arc<AccountManager>,
@@ -16,14 +16,16 @@ impl CodexLimitsAction {
         Self { manager }
     }
 
-    fn spawn_refresh_with_feedback(&self, instance_id: String) {
-        let manager = self.manager.clone();
+    async fn spawn_refresh_with_feedback(&self, instance_id: String) {
+        let result = self.manager.start_manual_refresh(instance_id.clone()).await;
         tokio::spawn(async move {
-            let result = manager.force_refresh(&instance_id).await;
             let Some(instance) = get_instance(instance_id.clone()).await else {
                 return;
             };
 
+            let Some(result) = result.await else {
+                return;
+            };
             match result {
                 Ok(()) => {
                     if let Err(error) = instance.show_ok().await {
@@ -42,11 +44,11 @@ impl CodexLimitsAction {
         });
     }
 
-    fn spawn_account_discovery(&self, instance_id: String, settings: &TileSettings) {
-        let executable = if settings.codex_executable.trim().is_empty() {
-            "codex".to_owned()
+    fn spawn_account_discovery(instance_id: String, executable: &str) {
+        let executable = if executable.trim().is_empty() {
+            DEFAULT_EXECUTABLE.to_owned()
         } else {
-            settings.codex_executable.trim().to_owned()
+            executable.trim().to_owned()
         };
 
         tokio::spawn(async move {
@@ -78,7 +80,7 @@ impl Action for CodexLimitsAction {
         settings: &Self::Settings,
     ) -> OpenActionResult<()> {
         self.manager
-            .subscribe(instance.instance_id.clone(), settings.clone())
+            .subscribe(instance.instance_id.clone(), settings)
             .await;
         Ok(())
     }
@@ -97,7 +99,8 @@ impl Action for CodexLimitsAction {
         instance: &Instance,
         _settings: &Self::Settings,
     ) -> OpenActionResult<()> {
-        self.spawn_refresh_with_feedback(instance.instance_id.clone());
+        self.spawn_refresh_with_feedback(instance.instance_id.clone())
+            .await;
         Ok(())
     }
 
@@ -107,7 +110,7 @@ impl Action for CodexLimitsAction {
         settings: &Self::Settings,
     ) -> OpenActionResult<()> {
         self.manager
-            .subscribe(instance.instance_id.clone(), settings.clone())
+            .subscribe(instance.instance_id.clone(), settings)
             .await;
         Ok(())
     }
@@ -117,7 +120,7 @@ impl Action for CodexLimitsAction {
         instance: &Instance,
         _settings: &Self::Settings,
     ) -> OpenActionResult<()> {
-        self.manager.send_status(&instance.instance_id).await;
+        self.manager.publish_tile(&instance.instance_id).await;
         Ok(())
     }
 
@@ -129,18 +132,19 @@ impl Action for CodexLimitsAction {
     ) -> OpenActionResult<()> {
         match payload.get("event").and_then(Value::as_str) {
             Some("discoverAccounts") => {
-                self.spawn_account_discovery(instance.instance_id.clone(), settings);
-                Ok(())
+                let executable = payload
+                    .get("codexExecutable")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&settings.codex_executable);
+                Self::spawn_account_discovery(instance.instance_id.clone(), executable);
             }
             Some("refreshNow") => {
-                self.spawn_refresh_with_feedback(instance.instance_id.clone());
-                Ok(())
+                self.spawn_refresh_with_feedback(instance.instance_id.clone())
+                    .await
             }
-            Some(other) => {
-                log::debug!("Ignoring unknown property inspector event: {other}");
-                Ok(())
-            }
-            None => Ok(()),
+            Some(other) => log::debug!("Ignoring unknown property inspector event: {other}"),
+            None => {}
         }
+        Ok(())
     }
 }

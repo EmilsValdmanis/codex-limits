@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3abe7e">
+  <img alt="Latest release" src="https://img.shields.io/github/v/release/EmilsValdmanis/codex-limits?color=3abe7e">
   <img alt="Linux x86_64" src="https://img.shields.io/badge/platform-Linux%20x86__64-596674">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-e36b35">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-596674"></a>
@@ -37,7 +37,7 @@ refresh in the background, and press a key whenever you want a fresh reading.
 - OpenDeck 2.13.1 or newer
 - A recent Codex CLI with `codex app-server`
 - `codex` available on the environment `PATH` used by OpenDeck
-- Rust and `zip` when building the package locally
+- Rust, `zip`, and `flock` (util-linux) when building the package locally
 
 ## Build and install
 
@@ -146,19 +146,8 @@ OpenDeck plugin logs normally live under:
 
 ## Development
 
-Run the complete local gate:
-
-```bash
-cargo fmt --check
-cargo clippy --all-targets --locked -- -D warnings
-cargo test --locked
-node --check assets/propertyInspector/inspector.js
-node --test tests/inspector.test.cjs
-./scripts/package.sh
-```
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for local OpenDeck testing and pull
-request guidance.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the local test commands, packaging
+checks, and instructions for testing on a physical key.
 
 ## License
 

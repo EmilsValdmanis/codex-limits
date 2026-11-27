@@ -2,8 +2,9 @@ mod account_manager;
 mod action;
 mod app_server;
 mod discovery;
-mod model;
 mod render;
+mod settings;
+mod usage;
 
 use openaction::{OpenActionResult, register_action, run};
 use simplelog::{ColorChoice, Config, LevelFilter, TermLogger, TerminalMode};
@@ -22,8 +23,7 @@ async fn main() -> OpenActionResult<()> {
         eprintln!("Logger initialization failed: {error}");
     }
 
-    let manager = AccountManager::new();
-    manager.start();
+    let manager = AccountManager::start();
     register_action(CodexLimitsAction::new(manager)).await;
 
     run(std::env::args().collect()).await

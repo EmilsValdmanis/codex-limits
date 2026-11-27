@@ -1,17 +1,22 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
-use font8x8::{BASIC_FONTS, UnicodeFonts};
 use tiny_skia::{
     Color, FillRule, LineCap, LineJoin, Paint, PathBuilder, Pixmap, Rect, Stroke, Transform,
 };
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
-use crate::model::{LimitWindow, ResetCredits};
+mod text;
+
+use self::text::Font;
+use crate::usage::{LimitWindow, ResetCredits, UsageSnapshot};
 
 const WIDTH: u32 = 144;
 const HEIGHT: u32 = 144;
 const FOOTER_TEXT_Y: i32 = 116;
+const VALUE_FONT: Font = Font::basic(2);
+const COMPACT_VALUE_FONT: Font = Font::compact(2, 1);
+const MARGIN: i32 = 14;
 const FOOTER_ICON_Y: i32 = FOOTER_TEXT_Y - 1;
 
 #[derive(Clone, Debug)]
@@ -22,10 +27,8 @@ pub enum TileView {
     },
     Limits {
         label: String,
-        windows: Vec<LimitWindow>,
-        reset_credits: Option<ResetCredits>,
-        refreshing: bool,
-        stale: bool,
+        snapshot: UsageSnapshot,
+        freshness: Freshness,
     },
     Error {
         label: String,
@@ -33,15 +36,22 @@ pub enum TileView {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Freshness {
+    Ready,
+    Refreshing,
+    Stale,
+}
+
 pub fn render_data_uri(view: &TileView) -> Result<String, String> {
-    let png = render_png(view)?;
+    let png = render_png(view, unix_now())?;
     Ok(format!(
         "data:image/png;base64,{}",
         base64::engine::general_purpose::STANDARD.encode(png)
     ))
 }
 
-pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
+fn render_png(view: &TileView, now: i64) -> Result<Vec<u8>, String> {
     let mut pixmap = Pixmap::new(WIDTH, HEIGHT).ok_or("failed to allocate tile image")?;
     pixmap.fill(color(12, 15, 19));
     let label = match view {
@@ -72,28 +82,27 @@ pub fn render_png(view: &TileView) -> Result<Vec<u8>, String> {
             );
         }
         TileView::Limits {
-            windows,
-            reset_credits,
-            refreshing,
-            stale,
+            snapshot,
+            freshness,
             ..
         } => {
-            let now = unix_now();
-            if windows.is_empty() {
-                draw_centered(&mut pixmap, "NO LIMITS", 62, 2, color(129, 142, 154));
-            } else if windows.len() == 1 {
-                draw_window(&mut pixmap, &windows[0], 45, now);
-            } else {
-                draw_window(&mut pixmap, &windows[0], 27, now);
-                draw_window(&mut pixmap, &windows[1], 70, now);
+            match snapshot.windows.as_slice() {
+                [] => draw_centered(&mut pixmap, "NO LIMITS", 62, 2, color(129, 142, 154)),
+                [only] => draw_window(&mut pixmap, only, 45, now),
+                [first, second, ..] => {
+                    draw_window(&mut pixmap, first, 27, now);
+                    draw_window(&mut pixmap, second, 70, now);
+                }
             }
+            draw_reset_credits(&mut pixmap, snapshot.reset_credits.as_ref(), now);
 
-            draw_reset_credits(&mut pixmap, reset_credits.as_ref(), now);
-
-            if *refreshing {
-                fill_rect(&mut pixmap, 132.0, 10.0, 4.0, 4.0, color(65, 174, 255));
-            } else if *stale {
-                fill_rect(&mut pixmap, 132.0, 10.0, 4.0, 4.0, color(238, 164, 58));
+            let indicator = match freshness {
+                Freshness::Ready => None,
+                Freshness::Refreshing => Some(color(65, 174, 255)),
+                Freshness::Stale => Some(color(238, 164, 58)),
+            };
+            if let Some(indicator) = indicator {
+                fill_rect(&mut pixmap, 132.0, 10.0, 4.0, 4.0, indicator);
             }
         }
     }
@@ -113,21 +122,18 @@ fn draw_reset_credits(pixmap: &mut Pixmap, credits: Option<&ResetCredits>, now: 
         ),
         None => ("--".to_owned(), color(129, 142, 154)),
     };
-    draw_reset_icon(pixmap, 14, FOOTER_ICON_Y, count_color);
-    draw_compact_text(pixmap, &count, 33, FOOTER_TEXT_Y, 2, 1, count_color);
+    draw_reset_icon(pixmap, MARGIN, FOOTER_ICON_Y, count_color);
+    COMPACT_VALUE_FONT.draw(pixmap, &count, MARGIN + 19, FOOTER_TEXT_Y, count_color);
 
     let Some(expires_at) = credits.and_then(|credits| credits.earliest_expires_at) else {
         return;
     };
-    let expiry = countdown_label(expires_at, now).to_ascii_uppercase();
-    draw_compact_text(
+    let remaining = expires_at.saturating_sub(now);
+    draw_right_value(
         pixmap,
-        &expiry,
-        WIDTH as i32 - 14 - compact_text_width(&expiry, 2, 1),
+        &countdown_label(remaining),
         FOOTER_TEXT_Y,
-        2,
-        1,
-        reset_expiry_color(expires_at.saturating_sub(now)),
+        reset_expiry_color(remaining),
     );
 }
 
@@ -172,36 +178,20 @@ fn draw_reset_icon(pixmap: &mut Pixmap, x: i32, y: i32, icon_color: Color) {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResetExpiryUrgency {
-    Healthy,
-    Warning,
-    Critical,
-}
-
-fn reset_expiry_urgency(remaining_seconds: i64) -> ResetExpiryUrgency {
-    match remaining_seconds {
-        ..=86_400 => ResetExpiryUrgency::Critical,
-        86_401..=604_800 => ResetExpiryUrgency::Warning,
-        _ => ResetExpiryUrgency::Healthy,
-    }
-}
-
 fn reset_expiry_color(remaining_seconds: i64) -> Color {
-    match reset_expiry_urgency(remaining_seconds) {
-        ResetExpiryUrgency::Healthy => color(58, 190, 126),
-        ResetExpiryUrgency::Warning => color(238, 164, 58),
-        ResetExpiryUrgency::Critical => color(232, 72, 72),
+    match remaining_seconds {
+        ..=86_400 => color(232, 72, 72),
+        86_401..=604_800 => color(238, 164, 58),
+        _ => color(58, 190, 126),
     }
 }
 
-fn countdown_label(target_at: i64, now: i64) -> String {
-    let remaining = target_at.saturating_sub(now);
+fn countdown_label(remaining: i64) -> String {
     if remaining <= 0 {
         return "NOW".to_owned();
     }
     if remaining < 3_600 {
-        return format!("{}m", (remaining / 60).max(1));
+        return format!("{}M", (remaining / 60).max(1));
     }
 
     let total_hours = remaining / 3_600;
@@ -209,10 +199,10 @@ fn countdown_label(target_at: i64, now: i64) -> String {
     let hours = total_hours % 24;
     let minutes = (remaining / 60) % 60;
     match (days, hours) {
-        (0, hours) if minutes > 0 => format!("{hours}h {minutes}m"),
-        (0, hours) => format!("{hours}h"),
-        (days, 0) => format!("{days}d"),
-        (days, hours) => format!("{days}d {hours}h"),
+        (0, hours) if minutes > 0 => format!("{hours}H {minutes}M"),
+        (0, hours) => format!("{hours}H"),
+        (days, 0) => format!("{days}D"),
+        (days, hours) => format!("{days}D {hours}H"),
     }
 }
 
@@ -224,47 +214,16 @@ fn unix_now() -> i64 {
 }
 
 fn draw_header(pixmap: &mut Pixmap, label: &str) {
-    const MAX_CHARACTERS: usize = 10;
-    const SPACING: i32 = 3;
-
+    const HEADER_FONT: Font = Font::compact(2, 3);
     let normalized = normalize_header_label(label);
-    let label = truncate_with_ellipsis(&normalized, MAX_CHARACTERS);
-    let width = compact_text_width(&label, 2, SPACING);
-    draw_compact_text(
+    let label = truncate_with_ellipsis(&normalized, 10);
+    HEADER_FONT.draw(
         pixmap,
         &label,
-        (WIDTH as i32 - width) / 2,
+        (WIDTH as i32 - HEADER_FONT.width(&label)) / 2,
         8,
-        2,
-        SPACING,
         color(226, 232, 237),
     );
-}
-
-fn compact_text_width(text: &str, scale: i32, spacing: i32) -> i32 {
-    let characters = text.chars().count() as i32;
-    if characters == 0 {
-        0
-    } else {
-        characters * 5 * scale + (characters - 1) * spacing
-    }
-}
-
-fn draw_compact_text(
-    pixmap: &mut Pixmap,
-    text: &str,
-    x: i32,
-    y: i32,
-    scale: i32,
-    spacing: i32,
-    text_color: Color,
-) {
-    let mut cursor = x;
-    for character in text.chars() {
-        let glyph = header_glyph(character).map(|row| row.reverse_bits() >> 3);
-        draw_glyph(pixmap, &glyph, cursor, y, scale, text_color);
-        cursor += 5 * scale + spacing;
-    }
 }
 
 fn normalize_header_label(value: &str) -> String {
@@ -288,113 +247,16 @@ fn normalize_header_label(value: &str) -> String {
         .collect()
 }
 
-#[rustfmt::skip]
-fn header_glyph(character: char) -> [u8; 7] {
-    match character {
-        'A' => [0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'B' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110],
-        'C' => [0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111],
-        'D' => [0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110],
-        'E' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111],
-        'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
-        'G' => [0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111],
-        'H' => [0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001],
-        'I' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111],
-        'J' => [0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100],
-        'K' => [0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001],
-        'L' => [0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111],
-        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
-        'N' => [0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001],
-        'O' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
-        'Q' => [0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101],
-        'R' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001],
-        'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
-        'T' => [0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'U' => [0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110],
-        'V' => [0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b01010, 0b00100],
-        'W' => [0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001],
-        'X' => [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b01010, 0b10001],
-        'Y' => [0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100],
-        'Z' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111],
-        '0' => [0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110],
-        '1' => [0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110],
-        '2' => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111],
-        '3' => [0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110],
-        '4' => [0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010],
-        '5' => [0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110],
-        '6' => [0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110],
-        '7' => [0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000],
-        '8' => [0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110],
-        '9' => [0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110],
-        '-' => [0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000],
-        '_' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111],
-        '.' => [0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100],
-        '<' => [0b00001, 0b00010, 0b00100, 0b01000, 0b00100, 0b00010, 0b00001],
-        '~' => [0b00000, 0b00000, 0b01001, 0b10110, 0b00000, 0b00000, 0b00000],
-        '%' => [0b11001, 0b11010, 0b00100, 0b01000, 0b10110, 0b00110, 0b00000],
-        'd' => [0b00001, 0b00001, 0b01101, 0b10011, 0b10001, 0b10011, 0b01101],
-        'h' => [0b10000, 0b10000, 0b10110, 0b11001, 0b10001, 0b10001, 0b10001],
-        'i' => [0b00100, 0b00000, 0b01100, 0b00100, 0b00100, 0b00100, 0b01110],
-        'm' => [0b00000, 0b00000, 0b11010, 0b10101, 0b10101, 0b10101, 0b10101],
-        't' => [0b01000, 0b01000, 0b11100, 0b01000, 0b01000, 0b01001, 0b00110],
-        ' ' => [0; 7],
-        _ => [0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b00000, 0b00100],
-    }
-}
-
 fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32, now: i64) {
     let accent = quota_color(window.remaining_percent);
-    let mut label = window.label();
-    let percentage = format!("{}%", window.remaining_percent);
-    let label_color = color(154, 167, 178);
-    let label_width = text_width(&label, 2);
-    let compact_label_width = compact_text_width(&label, 2, 1);
-    let mut percentage_width = text_width(&percentage, 2);
-    let mut percentage_x = WIDTH as i32 - 14 - percentage_width;
-    let use_compact_label = 14 + label_width + 6 > percentage_x;
-    let use_compact_percentage = use_compact_label && 14 + compact_label_width + 6 > percentage_x;
-
-    if use_compact_percentage {
-        percentage_width = compact_text_width(&percentage, 2, 1);
-        percentage_x = WIDTH as i32 - 14 - percentage_width;
-
-        let label_space = (percentage_x - 6 - 14).max(0);
-        let label_capacity = ((label_space + 1) / 11).max(1) as usize;
-        label = truncate_with_ellipsis(&label, label_capacity);
-    }
-
-    // Keep the duration and percentage on one baseline. Long future duration
-    // labels use the narrower tile alphabet at nearly the same cap height
-    // instead of shrinking the entire row.
-    if !use_compact_label {
-        draw_text(pixmap, &label, 14, y, 2, label_color);
-    } else {
-        draw_compact_text(pixmap, &label, 14, y + 1, 2, 1, label_color);
-    }
-    if use_compact_percentage {
-        draw_compact_text(
-            pixmap,
-            &percentage,
-            percentage_x,
-            y + 1,
-            2,
-            1,
-            color(238, 242, 245),
-        );
-    } else {
-        draw_text(
-            pixmap,
-            &percentage,
-            percentage_x,
-            y,
-            2,
-            color(238, 242, 245),
-        );
-    }
-
-    const BAR_X: f32 = 14.0;
-    const BAR_WIDTH: f32 = 116.0;
+    draw_window_values(
+        pixmap,
+        &window.label(),
+        &format!("{}%", window.remaining_percent),
+        y,
+    );
+    const BAR_X: f32 = MARGIN as f32;
+    const BAR_WIDTH: f32 = WIDTH as f32 - 2.0 * BAR_X;
     let time_left = window.time_remaining_percent(now);
     let (bar_y, height) = if time_left.is_some() {
         ((y + 19) as f32, 4.0)
@@ -412,23 +274,44 @@ fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32, now: i64) {
         fill_rect(pixmap, BAR_X, bar_y, width, height, accent);
     }
 
-    // Keep organic reset timing at the same physical type size as the primary
-    // values. A short "IN" cue leaves room for days and hours without falling
-    // back to the 1px glyphs that blur on a Stream Deck display.
     let reset_y = y + 27;
     let reset_time = window
         .resets_at
-        .map(|resets_at| countdown_label(resets_at, now).to_ascii_uppercase())
+        .map(|at| countdown_label(at.saturating_sub(now)))
         .unwrap_or_else(|| "--".to_owned());
-    draw_compact_text(pixmap, "IN", 14, reset_y, 2, 1, color(129, 142, 154));
-    draw_compact_text(
+    COMPACT_VALUE_FONT.draw(pixmap, "IN", MARGIN, reset_y, color(129, 142, 154));
+    draw_right_value(pixmap, &reset_time, reset_y, color(193, 203, 211));
+}
+
+fn draw_right_value(pixmap: &mut Pixmap, value: &str, y: i32, color: Color) {
+    let x = WIDTH as i32 - MARGIN - COMPACT_VALUE_FONT.width(value);
+    COMPACT_VALUE_FONT.draw(pixmap, value, x, y, color);
+}
+
+fn draw_window_values(pixmap: &mut Pixmap, label: &str, percentage: &str, y: i32) {
+    let available = WIDTH as i32 - 2 * MARGIN - 6;
+    let fits = |font: Font| font.width(label) + VALUE_FONT.width(percentage) <= available;
+    let standard = (VALUE_FONT, y);
+    let compact = (COMPACT_VALUE_FONT, y + 1);
+    let ((label_font, label_y), (percentage_font, percentage_y)) = if fits(VALUE_FONT) {
+        (standard, standard)
+    } else if fits(COMPACT_VALUE_FONT) {
+        (compact, standard)
+    } else {
+        (compact, compact)
+    };
+    let percentage_width = percentage_font.width(percentage);
+    let label = truncate_with_ellipsis(
+        label,
+        label_font.capacity(available - percentage_width).max(1),
+    );
+    label_font.draw(pixmap, &label, MARGIN, label_y, color(154, 167, 178));
+    percentage_font.draw(
         pixmap,
-        &reset_time,
-        WIDTH as i32 - 14 - compact_text_width(&reset_time, 2, 1),
-        reset_y,
-        2,
-        1,
-        color(193, 203, 211),
+        percentage,
+        WIDTH as i32 - MARGIN - percentage_width,
+        percentage_y,
+        color(238, 242, 245),
     );
 }
 
@@ -453,66 +336,14 @@ fn truncate_with_ellipsis(value: &str, max_characters: usize) -> String {
 }
 
 fn draw_centered(pixmap: &mut Pixmap, text: &str, y: i32, scale: i32, text_color: Color) {
-    let width = text_width(text, scale);
-    draw_text(
+    let font = Font::basic(scale);
+    font.draw(
         pixmap,
         text,
-        ((WIDTH as i32 - width) / 2).max(6),
+        ((WIDTH as i32 - font.width(text)) / 2).max(6),
         y,
-        scale,
         text_color,
     );
-}
-
-fn text_width(text: &str, scale: i32) -> i32 {
-    let characters = text.chars().count() as i32;
-    if characters == 0 {
-        0
-    } else {
-        characters * 8 * scale + (characters - 1) * scale
-    }
-}
-
-fn draw_text(pixmap: &mut Pixmap, text: &str, x: i32, y: i32, scale: i32, text_color: Color) {
-    let mut cursor = x;
-    for character in text.chars() {
-        let glyph_y = if character == '~' { y + scale * 2 } else { y };
-        let glyph = BASIC_FONTS
-            .get(character)
-            .or_else(|| BASIC_FONTS.get('?'))
-            .unwrap_or([0; 8]);
-        draw_glyph(pixmap, &glyph, cursor, glyph_y, scale, text_color);
-        cursor += 9 * scale;
-    }
-}
-
-// Both bitmap fonts use opaque, integer-aligned cells. Write those pixels
-// directly; paths and fractional quota bars still use tiny-skia's rasterizer.
-// Rows are encoded least-significant bit first, matching font8x8.
-fn draw_glyph(pixmap: &mut Pixmap, glyph: &[u8], x: i32, y: i32, scale: i32, fill: Color) {
-    debug_assert_eq!(fill.alpha(), 1.0);
-    debug_assert!(scale > 0);
-    let width = pixmap.width() as i32;
-    let height = pixmap.height() as i32;
-    let pixel = fill.premultiply().to_color_u8();
-    let pixels = pixmap.pixels_mut();
-
-    for (row, bits) in glyph.iter().enumerate() {
-        let top = y + row as i32 * scale;
-        let bottom = (top + scale).clamp(0, height);
-        for column in 0..8 {
-            if bits & (1 << column) == 0 {
-                continue;
-            }
-            let left = x + column * scale;
-            let right = (left + scale).clamp(0, width) as usize;
-            let left = left.clamp(0, width) as usize;
-            for row in top.max(0)..bottom {
-                let offset = row as usize * width as usize;
-                pixels[offset + left..offset + right].fill(pixel);
-            }
-        }
-    }
 }
 
 fn fill_rect(pixmap: &mut Pixmap, x: f32, y: f32, width: f32, height: f32, fill: Color) {
@@ -535,17 +366,9 @@ mod tests {
 
     fn window(remaining: u8, duration: u64) -> LimitWindow {
         LimitWindow {
-            used_percent: 100 - remaining,
             remaining_percent: remaining,
             duration_minutes: Some(duration),
             resets_at: None,
-        }
-    }
-
-    fn window_reset(remaining: u8, duration: u64, resets_in: i64) -> LimitWindow {
-        LimitWindow {
-            resets_at: Some(unix_now() + resets_in),
-            ..window(remaining, duration)
         }
     }
 
@@ -554,7 +377,7 @@ mod tests {
         let now = 1_000;
         let tick = color(238, 242, 245).premultiply().to_color_u8();
         for (duration, seconds_left, expected_x) in [
-            (Some(300), Some(4_600), Some(43)), // 25.56% rounds to 26%
+            (Some(300), Some(4_600), Some(43)),
             (Some(10_080), Some(302_400), Some(71)),
             (Some(300), Some(-1), Some(14)),
             (Some(300), Some(20_000), Some(128)),
@@ -583,7 +406,7 @@ mod tests {
     fn keeps_the_last_quota_pixel_visible_and_preserves_unmarked_bar_height() {
         let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
         let mut window = window(1, 300);
-        let red = quota_color(1).premultiply().to_color_u8();
+        let red = color(232, 72, 72).premultiply().to_color_u8();
         draw_window(&mut pixmap, &window, 0, 0);
         for y in 18..25 {
             assert_eq!(pixmap.pixel(14, y), Some(red));
@@ -606,7 +429,11 @@ mod tests {
         })
     }
 
-    fn tile_states() -> [TileView; 6] {
+    fn tile_states(now: i64) -> [TileView; 6] {
+        let window_reset = |remaining, duration, resets_in| LimitWindow {
+            resets_at: Some(now + resets_in),
+            ..window(remaining, duration)
+        };
         [
             TileView::Unconfigured,
             TileView::Loading {
@@ -614,27 +441,30 @@ mod tests {
             },
             TileView::Limits {
                 label: "CONTEXTIVO".into(),
-                windows: vec![
-                    window_reset(93, 300, 4 * 3_600),
-                    window_reset(58, 10_080, 2 * 86_400 + 7 * 3_600),
-                ],
-                reset_credits: resets(2, Some(unix_now() + 3 * 86_400 + 4 * 3_600)),
-                refreshing: false,
-                stale: false,
+                snapshot: UsageSnapshot {
+                    windows: vec![
+                        window_reset(93, 300, 4 * 3_600),
+                        window_reset(58, 10_080, 2 * 86_400 + 7 * 3_600),
+                    ],
+                    reset_credits: resets(2, Some(now + 3 * 86_400 + 4 * 3_600)),
+                },
+                freshness: Freshness::Ready,
             },
             TileView::Limits {
                 label: "PLUS".into(),
-                windows: vec![window_reset(17, 43_800, 18 * 86_400 + 9 * 3_600)],
-                reset_credits: resets(0, None),
-                refreshing: true,
-                stale: false,
+                snapshot: UsageSnapshot {
+                    windows: vec![window_reset(17, 43_800, 18 * 86_400 + 9 * 3_600)],
+                    reset_credits: resets(0, None),
+                },
+                freshness: Freshness::Refreshing,
             },
             TileView::Limits {
                 label: "RĪGA ACCOUNT".into(),
-                windows: vec![window(44, 10_080)],
-                reset_credits: None,
-                refreshing: false,
-                stale: true,
+                snapshot: UsageSnapshot {
+                    windows: vec![window(44, 10_080)],
+                    reset_credits: None,
+                },
+                freshness: Freshness::Stale,
             },
             TileView::Error {
                 label: "OITG".into(),
@@ -646,7 +476,7 @@ mod tests {
     #[test]
     #[ignore = "manual release-mode performance measurement"]
     fn benchmark_rendering() {
-        let states = tile_states();
+        let states = tile_states(unix_now());
         let mut samples = Vec::new();
         for _ in 0..7 {
             let start = std::time::Instant::now();
@@ -666,7 +496,8 @@ mod tests {
 
     #[test]
     fn renders_all_tile_states_as_144_square_pngs() {
-        let states = tile_states();
+        let now = 1_800_000_000;
+        let states = tile_states(now);
 
         let preview_directory =
             std::env::var_os("CODEX_LIMITS_RENDER_DIR").map(std::path::PathBuf::from);
@@ -675,162 +506,112 @@ mod tests {
         }
 
         for (index, state) in states.into_iter().enumerate() {
-            let png = render_png(&state).unwrap();
-            assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+            let png = render_png(&state, now).unwrap();
             let image = tiny_skia::Pixmap::decode_png(&png).unwrap();
-            assert_eq!(image.width(), WIDTH);
-            assert_eq!(image.height(), HEIGHT);
+            assert_eq!((image.width(), image.height()), (144, 144));
             if let Some(directory) = &preview_directory {
                 std::fs::write(directory.join(format!("tile-{index}.png")), png).unwrap();
             }
         }
     }
 
+    fn header_pixels(label: &str) -> Pixmap {
+        let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
+        draw_header(&mut pixmap, label);
+        pixmap
+    }
+
     #[test]
-    fn bitmap_rasterization_matches_tiny_skia_including_clipped_cells() {
-        let glyph = [0, 1, 0x80, 0xff, 0x55, 0xaa, 0x18, 0];
-        let foreground = color(65, 174, 255);
-        for scale in [1, 2, 4] {
-            for x in [-32, -3, 0, 10, 23, 32] {
-                for y in [-32, -3, 0, 10, 23, 32] {
-                    let mut actual = Pixmap::new(24, 24).unwrap();
-                    actual.fill(color(12, 15, 19));
-                    let mut expected = actual.clone();
-                    draw_glyph(&mut actual, &glyph, x, y, scale, foreground);
-                    for (row, bits) in glyph.iter().enumerate() {
-                        for column in 0..8 {
-                            if bits & (1 << column) != 0 {
-                                // Clip before invoking the reference rasterizer:
-                                // its rounding can paint an extra edge pixel for
-                                // rectangles ending at coordinate zero.
-                                let left = (x + column * scale).max(0);
-                                let top = (y + row as i32 * scale).max(0);
-                                let right = (x + (column + 1) * scale).min(24);
-                                let bottom = (y + (row as i32 + 1) * scale).min(24);
-                                if right <= left || bottom <= top {
-                                    continue;
-                                }
-                                fill_rect(
-                                    &mut expected,
-                                    left as f32,
-                                    top as f32,
-                                    (right - left) as f32,
-                                    (bottom - top) as f32,
-                                    foreground,
-                                );
-                            }
-                        }
-                    }
-                    let mismatch = actual
-                        .pixels()
-                        .iter()
-                        .zip(expected.pixels())
-                        .position(|(left, right)| left != right);
-                    assert!(
-                        mismatch.is_none(),
-                        "x={x}, y={y}, scale={scale}, mismatch={:?}",
-                        mismatch.map(|index| (
-                            index,
-                            actual.pixels()[index],
-                            expected.pixels()[index]
-                        ))
-                    );
+    fn truncates_and_transliterates_rendered_headers() {
+        for (label, expected) in [
+            ("CODEX CONTEXTIVO", "CODEX C..."),
+            ("Pēteris", "PETERIS"),
+            ("Crème Brûl", "CREME BRUL"),
+        ] {
+            let header = header_pixels(label);
+            assert_ne!(header, header_pixels(""));
+            assert_eq!(header, header_pixels(expected));
+        }
+    }
+
+    fn occupied_bounds(
+        pixmap: &Pixmap,
+        ink: Color,
+        xs: std::ops::Range<u32>,
+        ys: std::ops::Range<u32>,
+    ) -> (u32, u32, u32, u32) {
+        let pixel = ink.premultiply().to_color_u8();
+        let mut bounds = None;
+        for y in ys {
+            for x in xs.clone() {
+                if pixmap.pixel(x, y) == Some(pixel) {
+                    let (left, top, right, bottom) = bounds.unwrap_or((x, y, x, y));
+                    bounds = Some((left.min(x), top.min(y), right.max(x), bottom.max(y)));
                 }
             }
         }
+        bounds.expect("expected visible ink")
     }
 
     #[test]
-    fn truncates_long_headers_with_an_ellipsis() {
-        assert_eq!(truncate_with_ellipsis("CONTEXTIVO", 10), "CONTEXTIVO");
-        assert_eq!(truncate_with_ellipsis("CODEX CONTEXTIVO", 10), "CODEX C...");
-        assert_eq!(compact_text_width("PLUS", 2, 3), 49);
-        assert!(compact_text_width("CONTEXTIVO", 2, 3) < WIDTH as i32);
-    }
-
-    #[test]
-    fn keeps_the_largest_practical_reset_countdown_at_full_type_size() {
-        let cue_right = 14 + compact_text_width("IN", 2, 1);
-        for label in ["999D 23H", "23H 59M", "4H 59M"] {
-            let countdown_left = WIDTH as i32 - 14 - compact_text_width(label, 2, 1);
-            assert!(
-                cue_right < countdown_left,
-                "countdown overlaps cue: {label}"
-            );
+    fn keeps_reset_countdowns_readable_beside_the_cue() {
+        for resets_at in [
+            999 * 86_400 + 23 * 3600,
+            23 * 3600 + 59 * 60,
+            4 * 3600 + 59 * 60,
+        ] {
+            let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
+            let window = LimitWindow {
+                resets_at: Some(resets_at),
+                ..window(50, 300)
+            };
+            draw_window(&mut pixmap, &window, 0, 0);
+            let (_, _, cue_right, _) =
+                occupied_bounds(&pixmap, color(129, 142, 154), 0..WIDTH, 27..45);
+            let (left, top, _, bottom) =
+                occupied_bounds(&pixmap, color(193, 203, 211), 0..WIDTH, 27..45);
+            assert!(cue_right + 1 < left);
+            assert_eq!(bottom - top + 1, 14);
         }
-    }
-
-    #[test]
-    fn transliterates_unicode_headers_before_drawing() {
-        assert_eq!(normalize_header_label("Pēteris"), "PETERIS");
-        assert_eq!(normalize_header_label("Crème Brûlée"), "CREME BRULEE");
-
-        let png = render_png(&TileView::Limits {
-            label: "Rīga ĀŽ".into(),
-            windows: vec![window(88, 10_080)],
-            reset_credits: resets(12, Some(unix_now() + 12 * 86_400 + 23 * 3_600)),
-            refreshing: false,
-            stale: false,
-        })
-        .unwrap();
-        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
     }
 
     #[test]
     fn formats_reset_countdowns_as_days_hours_and_minutes() {
-        let now = 1_800_000_000;
-        assert_eq!(countdown_label(now + 3 * 86_400 + 4 * 3_600, now), "3d 4h");
-        assert_eq!(countdown_label(now + 2 * 86_400, now), "2d");
-        assert_eq!(countdown_label(now + 7 * 3_600, now), "7h");
-        assert_eq!(countdown_label(now + 5 * 3_600, now), "5h");
-        assert_eq!(countdown_label(now + 5 * 3_600 - 1, now), "4h 59m");
-        assert_eq!(countdown_label(now + 3_660, now), "1h 1m");
-        assert_eq!(countdown_label(now + 3_600, now), "1h");
-        assert_eq!(countdown_label(now + 86_399, now), "23h 59m");
-        assert_eq!(countdown_label(now + 86_400, now), "1d");
-        assert_eq!(countdown_label(now + 3_599, now), "59m");
-        assert_eq!(countdown_label(now + 60, now), "1m");
-        assert_eq!(countdown_label(now + 1, now), "1m");
-        assert_eq!(countdown_label(now, now), "NOW");
+        assert_eq!(countdown_label(3 * 86_400 + 4 * 3_600), "3D 4H");
+        assert_eq!(countdown_label(2 * 86_400), "2D");
+        assert_eq!(countdown_label(7 * 3_600), "7H");
+        assert_eq!(countdown_label(5 * 3_600), "5H");
+        assert_eq!(countdown_label(5 * 3_600 - 1), "4H 59M");
+        assert_eq!(countdown_label(3_660), "1H 1M");
+        assert_eq!(countdown_label(3_600), "1H");
+        assert_eq!(countdown_label(86_399), "23H 59M");
+        assert_eq!(countdown_label(86_400), "1D");
+        assert_eq!(countdown_label(3_599), "59M");
+        assert_eq!(countdown_label(60), "1M");
+        assert_eq!(countdown_label(1), "1M");
+        assert_eq!(countdown_label(0), "NOW");
     }
 
     #[test]
     fn changes_reset_expiry_urgency_as_time_runs_out() {
-        assert_eq!(
-            reset_expiry_urgency(8 * 86_400),
-            ResetExpiryUrgency::Healthy
-        );
-        assert_eq!(
-            reset_expiry_urgency(7 * 86_400),
-            ResetExpiryUrgency::Warning
-        );
-        assert_eq!(reset_expiry_urgency(86_401), ResetExpiryUrgency::Warning);
-        assert_eq!(reset_expiry_urgency(86_400), ResetExpiryUrgency::Critical);
-        assert_eq!(reset_expiry_urgency(0), ResetExpiryUrgency::Critical);
+        assert_eq!(reset_expiry_color(8 * 86_400), color(58, 190, 126));
+        assert_eq!(reset_expiry_color(7 * 86_400), color(238, 164, 58));
+        assert_eq!(reset_expiry_color(86_401), color(238, 164, 58));
+        assert_eq!(reset_expiry_color(86_400), color(232, 72, 72));
+        assert_eq!(reset_expiry_color(0), color(232, 72, 72));
     }
 
     #[test]
     fn aligns_the_reset_icon_with_the_footer_text() {
-        fn occupied_y_bounds(pixmap: &Pixmap) -> (u32, u32) {
-            let occupied_rows = (0..pixmap.height()).filter(|&y| {
-                let row_start = (y * pixmap.width() * 4) as usize;
-                pixmap.data()[row_start..row_start + (pixmap.width() * 4) as usize]
-                    .iter()
-                    .skip(3)
-                    .step_by(4)
-                    .any(|alpha| *alpha != 0)
-            });
-
-            let rows = occupied_rows.collect::<Vec<_>>();
-            (*rows.first().unwrap(), *rows.last().unwrap())
-        }
-
-        let mut icon = Pixmap::new(24, 24).unwrap();
-        draw_reset_icon(&mut icon, 4, 3, color(65, 174, 255));
-
-        let mut count = Pixmap::new(24, 24).unwrap();
-        draw_compact_text(&mut count, "2", 4, 4, 2, 1, color(65, 174, 255));
-
-        assert_eq!(occupied_y_bounds(&icon), occupied_y_bounds(&count));
+        let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
+        let credits = ResetCredits {
+            available_count: 2,
+            earliest_expires_at: None,
+        };
+        draw_reset_credits(&mut pixmap, Some(&credits), 0);
+        let ink = color(65, 174, 255);
+        let (_, icon_top, _, icon_bottom) = occupied_bounds(&pixmap, ink, 0..32, 100..HEIGHT);
+        let (_, count_top, _, count_bottom) = occupied_bounds(&pixmap, ink, 32..WIDTH, 100..HEIGHT);
+        assert_eq!((icon_top, icon_bottom), (count_top, count_bottom));
     }
 }
