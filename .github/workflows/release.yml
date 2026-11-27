@@ -1,0 +1,81 @@
+name: Publish plugin release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.toml
+      - assets/manifest.json
+      - .github/workflows/release.yml
+
+concurrency:
+  group: publish-plugin-release
+  queue: max
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check package version
+        id: version
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          jq -e --arg version "$version" '.Version == $version' assets/manifest.json > /dev/null || {
+            echo "::error::Cargo.toml and assets/manifest.json must have the same version."
+            exit 1
+          }
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check release status
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          release=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" |
+            jq -r --arg tag "$TAG" '.[] | select(.tag_name == $tag) | if .draft then .target_commitish else "published" end')
+          if [[ "$release" == published ]]; then
+            echo "$TAG is already published."
+            exit 0
+          fi
+          if git show-ref --verify --quiet "refs/tags/$TAG" && [[ $(git rev-list -1 "refs/tags/$TAG") != "$GITHUB_SHA" ]]; then
+            echo "::error::Existing $TAG points to a different commit."
+            exit 1
+          fi
+          if [[ -n "$release" && "$release" != "$GITHUB_SHA" ]]; then
+            echo "::error::Existing draft for $TAG targets a different commit."
+            exit 1
+          fi
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          if [[ -n "$release" ]]; then
+            echo "draft=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and test plugin
+        if: steps.release.outputs.publish == 'true'
+        run: |
+          cargo test --locked
+          node --test tests/inspector.test.cjs
+          ./scripts/package.sh
+
+      - name: Publish with GitHub-generated notes
+        if: steps.release.outputs.publish == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          DRAFT: ${{ steps.release.outputs.draft }}
+        run: |
+          if [[ "$DRAFT" != true ]]; then
+            gh release create "$TAG" --target "$GITHUB_SHA" --generate-notes --draft
+          fi
+          gh release upload "$TAG" dist/com.emilsvaldmanis.codexlimits.streamDeckPlugin --clobber
+          gh release edit "$TAG" --draft=false
