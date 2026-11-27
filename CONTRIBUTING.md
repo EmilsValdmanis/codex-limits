@@ -55,3 +55,12 @@ account data only.
 Keep changes focused, explain user-visible behavior, and include tests for
 protocol parsing, cache behavior, or rendering changes. Screenshots from the
 physical device are especially useful for tile-layout changes.
+
+## Releases
+
+To publish a version, update the package version in `Cargo.toml` and
+`assets/manifest.json` together, refresh `Cargo.lock`, and update the README
+badge. Once the change reaches `main`, GitHub Actions tests and packages the
+plugin, then publishes `v<version>` with GitHub-generated release notes and
+the installable `.streamDeckPlugin` attached. If publishing is interrupted,
+rerun the workflow for that commit to finish the draft.
