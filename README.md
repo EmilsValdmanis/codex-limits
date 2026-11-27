@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img alt="Version 0.3.2" src="https://img.shields.io/badge/version-0.3.2-3abe7e">
+  <img alt="Version 0.4.0" src="https://img.shields.io/badge/version-0.4.0-3abe7e">
   <img alt="Linux x86_64" src="https://img.shields.io/badge/platform-Linux%20x86__64-596674">
   <img alt="Built with Rust" src="https://img.shields.io/badge/built%20with-Rust-e36b35">
   <a href="LICENSE"><img alt="MIT license" src="https://img.shields.io/badge/license-MIT-596674"></a>
@@ -90,6 +90,11 @@ For each refresh, the plugin starts `codex app-server --stdio` with the selected
 child process. When Codex provides earned rate-limit reset details, the tile
 uses the authoritative available count and the earliest available expiry. It
 does not start a model turn.
+
+The colored bar shows the percentage of quota left. The white tick shows the
+percentage of time left until reset, moving left as the window runs down. If
+the fill ends before the tick, you have spent quota faster than an even pace.
+The tick appears when Codex supplies both a reset time and a positive window duration.
 
 Each quota row includes its normal service reset beneath the usage bar. For
 example, `IN 2d 7h` means that quota refreshes organically in two days and

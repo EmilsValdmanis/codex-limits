@@ -393,11 +393,23 @@ fn draw_window(pixmap: &mut Pixmap, window: &LimitWindow, y: i32, now: i64) {
         );
     }
 
-    let bar_y = y + 18;
-    fill_rect(pixmap, 14.0, bar_y as f32, 116.0, 7.0, color(37, 44, 51));
-    let width = 116.0 * f32::from(window.remaining_percent) / 100.0;
+    const BAR_X: f32 = 14.0;
+    const BAR_WIDTH: f32 = 116.0;
+    let time_left = window.time_remaining_percent(now);
+    let (bar_y, height) = if time_left.is_some() {
+        ((y + 19) as f32, 4.0)
+    } else {
+        ((y + 18) as f32, 7.0)
+    };
+    fill_rect(pixmap, BAR_X, bar_y, BAR_WIDTH, height, color(37, 44, 51));
+    if let Some(percent) = time_left {
+        let center = (BAR_WIDTH * f32::from(percent) / 100.0).round();
+        let x = BAR_X + (center - 1.0).clamp(0.0, BAR_WIDTH - 2.0);
+        fill_rect(pixmap, x, bar_y - 3.0, 2.0, 10.0, color(238, 242, 245));
+    }
+    let width = BAR_WIDTH * f32::from(window.remaining_percent) / 100.0;
     if width > 0.0 {
-        fill_rect(pixmap, 14.0, bar_y as f32, width, 7.0, accent);
+        fill_rect(pixmap, BAR_X, bar_y, width, height, accent);
     }
 
     // Keep organic reset timing at the same physical type size as the primary
@@ -535,6 +547,56 @@ mod tests {
             resets_at: Some(unix_now() + resets_in),
             ..window(remaining, duration)
         }
+    }
+
+    #[test]
+    fn draws_the_time_marker_independently_of_quota_and_within_the_track() {
+        let now = 1_000;
+        let tick = color(238, 242, 245).premultiply().to_color_u8();
+        for (duration, seconds_left, expected_x) in [
+            (Some(300), Some(4_600), Some(43)), // 25.56% rounds to 26%
+            (Some(10_080), Some(302_400), Some(71)),
+            (Some(300), Some(-1), Some(14)),
+            (Some(300), Some(20_000), Some(128)),
+            (None, Some(300), None),
+            (Some(0), Some(300), None),
+            (Some(300), None, None),
+        ] {
+            let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
+            let window = LimitWindow {
+                duration_minutes: duration,
+                resets_at: seconds_left.map(|seconds| now + seconds),
+                ..window(60, 300)
+            };
+            draw_window(&mut pixmap, &window, 0, now);
+            for y in [16, 17, 18, 23, 24, 25] {
+                let marked = (0..WIDTH)
+                    .filter(|&x| pixmap.pixel(x, y) == Some(tick))
+                    .collect::<Vec<_>>();
+                let expected = expected_x.map_or_else(Vec::new, |x| vec![x, x + 1]);
+                assert_eq!(marked, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_the_last_quota_pixel_visible_and_preserves_unmarked_bar_height() {
+        let mut pixmap = Pixmap::new(WIDTH, HEIGHT).unwrap();
+        let mut window = window(1, 300);
+        let red = quota_color(1).premultiply().to_color_u8();
+        draw_window(&mut pixmap, &window, 0, 0);
+        for y in 18..25 {
+            assert_eq!(pixmap.pixel(14, y), Some(red));
+        }
+
+        window.resets_at = Some(1);
+        pixmap.fill(Color::TRANSPARENT);
+        draw_window(&mut pixmap, &window, 0, 0);
+        assert_eq!(pixmap.pixel(14, 20), Some(red));
+        assert_eq!(
+            pixmap.pixel(14, 17),
+            Some(color(238, 242, 245).premultiply().to_color_u8())
+        );
     }
 
     fn resets(count: u64, expires_at: Option<i64>) -> Option<ResetCredits> {
