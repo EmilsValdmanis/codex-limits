@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 390" role="img" aria-labelledby="title description">
   <title id="title">Codex Limits tile preview</title>
-  <desc id="description">Three Stream Deck tiles showing Codex quota, organic reset timing, earned reset counts, and the next reset-credit expiry</desc>
+  <desc id="description">Three Stream Deck tiles showing Codex quota, time-remaining ticks, organic reset timing, earned reset counts, and the next reset-credit expiry</desc>
   <defs>
     <g id="reset-icon" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
@@ -15,14 +15,16 @@
       <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">PERSONAL</text>
       <text x="48" y="74" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
       <text x="199" y="74" fill="#eef2f5" font-size="31" font-weight="700">93%</text>
-      <rect x="25" y="78" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="78" width="186" height="12" fill="#3abe7e"/>
+      <rect x="25" y="80" width="200" height="7" fill="#252c33"/>
+      <rect x="183" y="75" width="4" height="17" fill="#eef2f5"/>
+      <rect x="25" y="80" width="186" height="7" fill="#3abe7e"/>
       <text x="25" y="113" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">IN</text>
       <text x="225" y="113" text-anchor="end" fill="#c1cbd3" font-size="22" font-weight="700">4H</text>
       <text x="48" y="149" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
       <text x="199" y="149" fill="#eef2f5" font-size="31" font-weight="700">58%</text>
-      <rect x="25" y="153" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="153" width="116" height="12" fill="#3abe7e"/>
+      <rect x="25" y="155" width="200" height="7" fill="#252c33"/>
+      <rect x="89" y="150" width="4" height="17" fill="#eef2f5"/>
+      <rect x="25" y="155" width="116" height="7" fill="#3abe7e"/>
       <text x="25" y="188" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">IN</text>
       <text x="225" y="188" text-anchor="end" fill="#c1cbd3" font-size="22" font-weight="700">2D 7H</text>
       <use href="#reset-icon" transform="translate(25 205.5) scale(.92)" color="#41aeff"/>
@@ -35,8 +37,9 @@
       <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">TEAM</text>
       <text x="48" y="105" fill="#9aa7b2" font-size="24" font-weight="700">30d</text>
       <text x="199" y="105" fill="#eef2f5" font-size="31" font-weight="700">83%</text>
-      <rect x="25" y="109" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="109" width="166" height="12" fill="#3abe7e"/>
+      <rect x="25" y="111" width="200" height="7" fill="#252c33"/>
+      <rect x="145" y="106" width="4" height="17" fill="#eef2f5"/>
+      <rect x="25" y="111" width="166" height="7" fill="#3abe7e"/>
       <text x="25" y="144" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">IN</text>
       <text x="225" y="144" text-anchor="end" fill="#c1cbd3" font-size="22" font-weight="700">18D 9H</text>
       <use href="#reset-icon" transform="translate(25 205.5) scale(.92)" color="#818e9a"/>
@@ -48,14 +51,16 @@
       <text x="125" y="37" fill="#e2e8ed" font-size="25" font-weight="700" letter-spacing="6">WORK</text>
       <text x="48" y="74" fill="#9aa7b2" font-size="24" font-weight="700">5h</text>
       <text x="199" y="74" fill="#eef2f5" font-size="31" font-weight="700">44%</text>
-      <rect x="25" y="78" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="78" width="88" height="12" fill="#eea43a"/>
+      <rect x="25" y="80" width="200" height="7" fill="#252c33"/>
+      <rect x="63" y="75" width="4" height="17" fill="#eef2f5"/>
+      <rect x="25" y="80" width="88" height="7" fill="#eea43a"/>
       <text x="25" y="113" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">IN</text>
       <text x="225" y="113" text-anchor="end" fill="#c1cbd3" font-size="22" font-weight="700">1H</text>
       <text x="48" y="149" fill="#9aa7b2" font-size="24" font-weight="700">7d</text>
       <text x="199" y="149" fill="#eef2f5" font-size="31" font-weight="700">17%</text>
-      <rect x="25" y="153" width="200" height="12" fill="#252c33"/>
-      <rect x="25" y="153" width="34" height="12" fill="#e84848"/>
+      <rect x="25" y="155" width="200" height="7" fill="#252c33"/>
+      <rect x="197" y="150" width="4" height="17" fill="#eef2f5"/>
+      <rect x="25" y="155" width="34" height="7" fill="#e84848"/>
       <text x="25" y="188" text-anchor="start" fill="#818e9a" font-size="22" font-weight="700">IN</text>
       <text x="225" y="188" text-anchor="end" fill="#c1cbd3" font-size="22" font-weight="700">6D 2H</text>
       <use href="#reset-icon" transform="translate(25 205.5) scale(.92)" color="#41aeff"/>

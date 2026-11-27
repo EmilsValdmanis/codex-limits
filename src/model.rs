@@ -91,6 +91,13 @@ impl LimitWindow {
     pub fn label(&self) -> String {
         duration_label(self.duration_minutes)
     }
+
+    pub fn time_remaining_percent(&self, now: i64) -> Option<u8> {
+        let minutes = self.duration_minutes.filter(|&minutes| minutes > 0)?;
+        let seconds_left = self.resets_at?.saturating_sub(now);
+        let share = seconds_left as f64 / (minutes as f64 * 60.0);
+        Some((share.clamp(0.0, 1.0) * 100.0).round() as u8)
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
