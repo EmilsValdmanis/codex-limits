@@ -4,8 +4,8 @@ Thanks for helping improve Codex Limits.
 
 ## Development setup
 
-You need a current Rust toolchain, Node.js, `zip`, and Linux x86_64. Clone the
-repository and run:
+On Linux x86_64, install a current Rust toolchain, Node.js, `zip`, and `flock`
+(from util-linux). Clone the repository and run:
 
 ```bash
 cargo test --locked
@@ -58,9 +58,9 @@ physical device are especially useful for tile-layout changes.
 
 ## Releases
 
-To publish a version, update the package version in `Cargo.toml` and
-`assets/manifest.json` together, refresh `Cargo.lock`, and update the README
-badge. Once the change reaches `main`, GitHub Actions tests and packages the
+To publish a version, update the package version in `Cargo.toml` and refresh
+`Cargo.lock`. Packaging writes that version into the OpenDeck manifest.
+Once the change reaches `main`, GitHub Actions tests and packages the
 plugin, then publishes `v<version>` with GitHub-generated release notes and
 the installable `.streamDeckPlugin` attached. If publishing is interrupted,
 rerun the workflow for that commit to finish the draft.

@@ -1,230 +1,174 @@
 "use strict";
 
-let socket;
-let context;
-let action;
-let settings = {
-  codexHome: "",
-  label: "",
-  refreshMinutes: 5,
-  codexExecutable: "codex",
-};
-let saveTimer;
-let lastSuggestedLabel = "";
-let discoveryQueued = false;
+function connectElgatoStreamDeckSocket(port, uuid, registerEvent, _info, actionInfoJson) {
+  const { action, context, payload } = JSON.parse(actionInfoJson);
+  const socket = new WebSocket(`ws://localhost:${port}`);
+  const account = document.getElementById("account");
+  const label = document.getElementById("label");
+  const refreshMinutes = document.getElementById("refresh-minutes");
+  const codexHome = document.getElementById("codex-home");
+  const codexExecutable = document.getElementById("codex-executable");
+  const discover = document.getElementById("discover");
 
-const elements = {};
+  let saveTimer;
+  let suggestedLabel = "";
+  let discovery = "idle";
+  const settings = payload.settings || {};
+  label.value = settings.label || "";
+  codexHome.value = settings.codexHome || "";
+  codexExecutable.value = settings.codexExecutable || codexExecutable.defaultValue;
+  refreshMinutes.value = interval(settings.refreshMinutes);
 
-function connectElgatoStreamDeckSocket(
-  inPort,
-  inPropertyInspectorUUID,
-  inRegisterEvent,
-  _inInfo,
-  inActionInfo,
-) {
-  const actionInfo = JSON.parse(inActionInfo);
-  context = actionInfo.context;
-  action = actionInfo.action;
-  settings = { ...settings, ...(actionInfo.payload.settings || {}) };
-
-  bindElements();
-  populateSettings();
-  bindEvents();
-
-  socket = new WebSocket(`ws://localhost:${inPort}`);
-  socket.addEventListener("open", () => {
-    socket.send(JSON.stringify({ event: inRegisterEvent, uuid: inPropertyInspectorUUID }));
-    elements.connectionLed.classList.add("is-online");
-    elements.connectionLed.title = "Connected";
-    requestAccounts();
-  });
-  socket.addEventListener("message", handleMessage);
-  socket.addEventListener("close", () => {
-    discoveryQueued = false;
-    elements.discover.classList.remove("is-busy");
-    elements.connectionLed.classList.remove("is-online");
-    setStatus("error", "Disconnected", "OpenDeck closed the inspector connection");
-  });
-}
-
-function bindElements() {
-  elements.account = document.getElementById("account");
-  elements.label = document.getElementById("label");
-  elements.refreshMinutes = document.getElementById("refresh-minutes");
-  elements.codexHome = document.getElementById("codex-home");
-  elements.codexExecutable = document.getElementById("codex-executable");
-  elements.discover = document.getElementById("discover");
-  elements.refresh = document.getElementById("refresh");
-  elements.connectionLed = document.getElementById("connection-led");
-  elements.statusDot = document.getElementById("status-dot");
-  elements.statusTitle = document.getElementById("status-title");
-  elements.statusDetail = document.getElementById("status-detail");
-}
-
-function populateSettings() {
-  elements.label.value = settings.label || "";
-  elements.refreshMinutes.value = clampRefresh(settings.refreshMinutes);
-  elements.codexHome.value = settings.codexHome || "";
-  elements.codexExecutable.value = settings.codexExecutable || "codex";
-}
-
-function bindEvents() {
-  elements.account.addEventListener("change", () => {
-    if (!elements.account.value) return;
-    const previousHome = elements.codexHome.value;
-    const canSuggestLabel =
-      !elements.label.value ||
-      elements.label.value === labelFromHome(previousHome) ||
-      elements.label.value === lastSuggestedLabel;
-    elements.codexHome.value = elements.account.value;
-    lastSuggestedLabel = defaultTileName(
-      elements.account.selectedOptions[0]?.dataset.planType,
-      elements.account.value,
-    );
-    if (canSuggestLabel) {
-      elements.label.value = lastSuggestedLabel;
-    }
-    saveSettings();
-  });
-
-  elements.label.addEventListener("input", scheduleSave);
-  elements.refreshMinutes.addEventListener("change", saveSettings);
-  elements.codexHome.addEventListener("change", () => {
-    selectCurrentHome();
-    saveSettings();
-  });
-  elements.codexExecutable.addEventListener("change", () => {
-    saveSettings();
-    requestAccounts();
-  });
-  elements.discover.addEventListener("click", requestAccounts);
-  elements.refresh.addEventListener("click", () => {
-    saveSettings();
-    sendToPlugin({ event: "refreshNow" });
-    setStatus("refreshing", "Refreshing", "Starting a fresh Codex app-server request");
-  });
-}
-
-function handleMessage(event) {
-  let message;
-  try {
-    message = JSON.parse(event.data);
-  } catch {
-    return;
-  }
-  if (message.event !== "sendToPropertyInspector") return;
-
-  const payload = message.payload || {};
-  if (payload.event === "accountsDiscovered") {
-    elements.discover.classList.remove("is-busy");
-    if (discoveryQueued) {
-      discoveryQueued = false;
-      requestAccounts();
-      return;
-    }
-    renderAccounts(payload.accounts || []);
-  } else if (payload.event === "status") {
-    const detail = payload.refreshedAt
-      ? `${payload.message} · ${formatTimestamp(payload.refreshedAt)}`
-      : payload.message;
-    setStatus(payload.state, statusHeading(payload.state), detail);
-  }
-}
-
-function renderAccounts(accounts) {
-  const selected = elements.codexHome.value;
-  elements.account.replaceChildren();
-
-  if (!accounts.length) {
-    elements.account.append(new Option("No Codex homes found", ""));
-  } else {
-    elements.account.append(new Option("Choose an account…", ""));
-    for (const account of accounts) {
-      const directory = labelFromHome(account.codexHome);
-      const identity = account.email || (account.signedIn ? "Signed in" : "Signed out");
-      const plan = account.planType ? ` · ${account.planType}` : "";
-      const option = new Option(`${directory} — ${identity}${plan}`, account.codexHome);
-      option.dataset.planType = account.planType || "";
-      elements.account.append(option);
-    }
+  function interval(value) {
+    const parsed = Number.parseInt(value, 10);
+    if (!Number.isFinite(parsed)) return Number(refreshMinutes.defaultValue);
+    return Math.min(Number(refreshMinutes.max), Math.max(Number(refreshMinutes.min), parsed));
   }
 
-  if (selected && !accounts.some((account) => account.codexHome === selected)) {
-    elements.account.append(new Option(`Manual — ${selected}`, selected));
+  function executable() {
+    return codexExecutable.value.trim() || codexExecutable.defaultValue;
   }
-  selectCurrentHome();
-  const current = accounts.find((account) => account.codexHome === selected);
-  if (current) {
-    lastSuggestedLabel = defaultTileName(current.planType, current.codexHome);
-    if (
-      !elements.label.value ||
-      elements.label.value === labelFromHome(selected)
-    ) {
-      elements.label.value = lastSuggestedLabel;
-      saveSettings();
-    }
+
+  function send(message) {
+    if (socket.readyState !== WebSocket.OPEN) return false;
+    socket.send(JSON.stringify(message));
+    return true;
   }
-}
 
-function selectCurrentHome() {
-  const home = elements.codexHome.value;
-  elements.account.value = [...elements.account.options].some(
-    (option) => option.value === home,
-  )
-    ? home
-    : "";
-}
+  function command(payload) {
+    return send({ action, context, event: "sendToPlugin", payload });
+  }
 
-function scheduleSave() {
-  clearTimeout(saveTimer);
-  saveTimer = setTimeout(saveSettings, 180);
-}
-
-function saveSettings() {
-  clearTimeout(saveTimer);
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  settings = {
-    codexHome: elements.codexHome.value.trim(),
-    label: elements.label.value.trim(),
-    refreshMinutes: clampRefresh(elements.refreshMinutes.value),
-    codexExecutable: elements.codexExecutable.value.trim() || "codex",
-  };
-  elements.refreshMinutes.value = settings.refreshMinutes;
-  socket.send(
-    JSON.stringify({
+  function saveSettings() {
+    clearTimeout(saveTimer);
+    const minutes = interval(refreshMinutes.value);
+    refreshMinutes.value = minutes;
+    send({
       event: "setSettings",
       context,
-      payload: settings,
-    }),
-  );
-}
-
-function requestAccounts() {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  if (elements.discover.classList.contains("is-busy")) {
-    discoveryQueued = true;
-    return;
+      payload: {
+        codexHome: codexHome.value.trim(),
+        label: label.value.trim(),
+        refreshMinutes: minutes,
+        codexExecutable: executable(),
+      },
+    });
   }
-  elements.discover.classList.add("is-busy");
-  sendToPlugin({ event: "discoverAccounts" });
-}
 
-function sendToPlugin(payload) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(
-    JSON.stringify({
-      action,
-      event: "sendToPlugin",
-      context,
-      payload,
-    }),
-  );
+  function setDiscovery(state) {
+    discovery = state;
+    discover.classList.toggle("is-busy", state !== "idle");
+  }
+
+  function requestAccounts() {
+    if (discovery !== "idle") {
+      setDiscovery("queued");
+    } else if (command({ event: "discoverAccounts", codexExecutable: executable() })) {
+      setDiscovery("pending");
+    }
+  }
+
+  function suggestLabel(home, planType, replaceableSuggestion) {
+    const previous = label.value;
+    const automatic =
+      !previous || previous === labelFromHome(codexHome.value) || previous === replaceableSuggestion;
+    suggestedLabel = (planType || labelFromHome(home) || "CL").toUpperCase();
+    if (automatic) label.value = suggestedLabel;
+    return label.value !== previous;
+  }
+
+  function selectHome() {
+    const home = codexHome.value;
+    account.value = [...account.options].some((option) => option.value === home) ? home : "";
+  }
+
+  function renderAccounts(accounts) {
+    const selected = codexHome.value;
+    account.replaceChildren(
+      new Option(accounts.length ? "Choose an account…" : "No Codex homes found", ""),
+    );
+    for (const entry of accounts) {
+      const directory = labelFromHome(entry.codexHome);
+      const identity = entry.email || (entry.signedIn ? "Signed in" : "Signed out");
+      const plan = entry.planType ? ` · ${entry.planType}` : "";
+      const option = new Option(`${directory} — ${identity}${plan}`, entry.codexHome);
+      option.dataset.planType = entry.planType || "";
+      account.append(option);
+    }
+
+    const current = accounts.find((entry) => entry.codexHome === selected);
+    if (current) {
+      if (suggestLabel(selected, current.planType)) saveSettings();
+    } else if (selected) {
+      account.append(new Option(`Manual — ${selected}`, selected));
+    }
+    selectHome();
+  }
+
+  account.addEventListener("change", () => {
+    if (!account.value) return;
+    suggestLabel(account.value, account.selectedOptions[0]?.dataset.planType, suggestedLabel);
+    codexHome.value = account.value;
+    saveSettings();
+  });
+  label.addEventListener("input", () => {
+    clearTimeout(saveTimer);
+    saveTimer = setTimeout(saveSettings, 180);
+  });
+  refreshMinutes.addEventListener("change", saveSettings);
+  codexHome.addEventListener("change", () => {
+    selectHome();
+    saveSettings();
+  });
+  codexExecutable.addEventListener("change", () => {
+    saveSettings();
+    requestAccounts();
+  });
+  discover.addEventListener("click", requestAccounts);
+  document.getElementById("refresh").addEventListener("click", () => {
+    saveSettings();
+    if (command({ event: "refreshNow" })) {
+      setStatus("refreshing", "Refreshing", "Starting a fresh Codex app-server request");
+    }
+  });
+
+  socket.addEventListener("open", () => {
+    send({ event: registerEvent, uuid });
+    requestAccounts();
+  });
+  socket.addEventListener("close", () => {
+    clearTimeout(saveTimer);
+    setDiscovery("idle");
+    setStatus("error", "Disconnected", "OpenDeck closed the inspector connection");
+  });
+  socket.addEventListener("message", (event) => {
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
+    if (message?.event !== "sendToPropertyInspector") return;
+
+    const payload = message.payload || {};
+    if (payload.event === "accountsDiscovered") {
+      const queued = discovery === "queued";
+      setDiscovery("idle");
+      if (queued) requestAccounts();
+      else renderAccounts(payload.accounts || []);
+    } else if (payload.event === "status") {
+      const detail = payload.refreshedAt
+        ? `${payload.message} · ${formatTimestamp(payload.refreshedAt)}`
+        : payload.message;
+      setStatus(payload.state, statusHeading(payload.state), detail);
+    }
+  });
 }
 
 function setStatus(state, title, detail) {
-  elements.statusDot.dataset.state = state;
-  elements.statusTitle.textContent = title;
-  elements.statusDetail.textContent = detail || "";
+  document.getElementById("status-dot").dataset.state = state;
+  document.getElementById("status-title").textContent = title;
+  document.getElementById("status-detail").textContent = detail || "";
 }
 
 function statusHeading(state) {
@@ -241,21 +185,7 @@ function statusHeading(state) {
 }
 
 function labelFromHome(home) {
-  return (home || "")
-    .replace(/\/+$/, "")
-    .split("/")
-    .pop()
-    .replace(/^\./, "");
-}
-
-function defaultTileName(planType, home) {
-  return (planType || labelFromHome(home) || "CL").toUpperCase();
-}
-
-function clampRefresh(value) {
-  const parsed = Number.parseInt(value, 10);
-  if (!Number.isFinite(parsed)) return 5;
-  return Math.min(1440, Math.max(1, parsed));
+  return home.trim().replace(/\/+$/, "").split("/").pop().replace(/^\.+/, "");
 }
 
 function formatTimestamp(seconds) {

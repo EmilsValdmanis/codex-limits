@@ -1,754 +1,259 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
+mod presentation;
+#[cfg(test)]
+mod tests;
+
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime};
 
 use openaction::get_instance;
-use serde::Serialize;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::{Mutex, broadcast};
 
 use crate::app_server::{AppServerClient, AppServerError};
-use crate::model::{TileSettings, UsageSnapshot};
-use crate::render::{TileView, render_data_uri};
+use crate::settings::TileSettings;
+use crate::usage::UsageSnapshot;
+use presentation::TilePresentation;
 
 const POLL_RESOLUTION: Duration = Duration::from_secs(5);
+// OpenDeck can restore the profile icon after a layout edit without notifying the
+// action. Reassert images above its two-second persistence debounce.
 const IMAGE_RECONCILE_INTERVAL: Duration = Duration::from_secs(4);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct AccountKey {
-    pub codex_home: PathBuf,
-    pub executable: String,
-}
+type RefreshResult = Result<(), AppServerError>;
 
-#[derive(Clone)]
 struct Subscription {
-    settings: TileSettings,
-    key: Option<AccountKey>,
-    setup_error: Option<AppServerError>,
+    label: String,
+    interval: Duration,
+    account: Result<AppServerClient, AppServerError>,
 }
 
 #[derive(Default)]
-struct CacheEntry {
-    snapshot: Option<UsageSnapshot>,
-    last_success: Option<SystemTime>,
+enum Refresh {
+    #[default]
+    Idle,
+    Running(broadcast::Receiver<RefreshResult>),
+    Failed(AppServerError),
+}
+
+#[derive(Default)]
+struct CachedAccount {
+    reading: Option<(UsageSnapshot, SystemTime)>,
     last_attempt: Option<Instant>,
-    error: Option<AppServerError>,
-    refreshing: bool,
-    waiters: Vec<oneshot::Sender<Result<(), AppServerError>>>,
+    refresh: Refresh,
+}
+
+impl CachedAccount {
+    fn active_request(&self) -> Option<&broadcast::Receiver<RefreshResult>> {
+        match &self.refresh {
+            Refresh::Running(result) if !result.is_closed() => Some(result),
+            _ => None,
+        }
+    }
+
+    fn is_due(&self, interval: Duration, now: Instant) -> bool {
+        self.active_request().is_none()
+            && self
+                .last_attempt
+                .is_none_or(|last| now.duration_since(last) >= interval)
+    }
 }
 
 #[derive(Default)]
 struct ManagerState {
-    subscriptions: HashMap<String, Subscription>,
-    caches: HashMap<AccountKey, CacheEntry>,
+    tiles: HashMap<String, Subscription>,
+    accounts: HashMap<AppServerClient, CachedAccount>,
+}
+
+impl ManagerState {
+    fn due_account<'a>(&self, tile: &'a Subscription, now: Instant) -> Option<&'a AppServerClient> {
+        tile.account.as_ref().ok().filter(|account| {
+            self.accounts
+                .get(*account)
+                .is_none_or(|cache| cache.is_due(tile.interval, now))
+        })
+    }
+
+    fn due_accounts(&self, now: Instant) -> HashSet<AppServerClient> {
+        self.tiles
+            .values()
+            .filter_map(|tile| self.due_account(tile, now).cloned())
+            .collect()
+    }
+
+    fn subscribers(&self, account: &AppServerClient) -> Vec<String> {
+        self.tiles
+            .iter()
+            .filter(|(_, tile)| tile.account.as_ref().ok() == Some(account))
+            .map(|(id, _)| id.clone())
+            .collect()
+    }
+
+    fn presentation(&self, id: &str) -> Option<TilePresentation> {
+        let tile = self.tiles.get(id)?;
+        Some(match &tile.account {
+            Ok(account) => TilePresentation::cached(&tile.label, &self.accounts[account]),
+            Err(error) => TilePresentation::error(&tile.label, error),
+        })
+    }
 }
 
 #[derive(Default)]
 pub struct AccountManager {
     state: Mutex<ManagerState>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct InspectorStatus {
-    event: &'static str,
-    state: &'static str,
-    message: String,
-    refreshed_at: Option<u64>,
+    publication: Mutex<()>,
 }
 
 impl AccountManager {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
-    }
-
-    pub fn start(self: &Arc<Self>) {
-        let manager = self.clone();
+    pub fn start() -> Arc<Self> {
+        let manager = Arc::new(Self::default());
+        let polling = manager.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(POLL_RESOLUTION);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
+            let mut interval = periodic(POLL_RESOLUTION);
             loop {
                 interval.tick().await;
-                for key in manager.due_keys().await {
-                    let manager = manager.clone();
-                    tokio::spawn(async move {
-                        let _ = manager.refresh_key(key).await;
-                    });
-                }
+                polling.poll_due().await;
             }
         });
-
-        // OpenDeck currently redraws every key from the profile snapshot whenever
-        // the layout is edited. Dynamic setImage values are not reflected in that
-        // frontend snapshot, so the manifest icon can overwrite a live tile even
-        // though this action received no lifecycle event. Reassert cached images
-        // independently of Codex polling; this does not start an app-server. The
-        // interval stays above OpenDeck's two-second image persistence debounce so
-        // the current design is saved instead of an old manifest fallback.
-        let manager = self.clone();
+        let repainting = manager.clone();
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(IMAGE_RECONCILE_INTERVAL);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
+            let mut interval = periodic(IMAGE_RECONCILE_INTERVAL);
             loop {
                 interval.tick().await;
-                manager.repaint_visible().await;
+                repainting.repaint_visible().await;
             }
         });
+        manager
     }
 
-    pub async fn subscribe(self: &Arc<Self>, instance_id: String, settings: TileSettings) {
-        let interval = refresh_interval(&settings);
-        let key_result = account_key(&settings);
-        let (key, setup_error) = match key_result {
-            Ok(key) => (Some(key), None),
-            Err(error) => (None, Some(error)),
+    pub async fn subscribe(self: &Arc<Self>, id: String, settings: &TileSettings) {
+        let subscription = Subscription {
+            label: settings.effective_label(),
+            interval: settings.refresh_interval(),
+            account: AppServerClient::from_settings(settings),
         };
-
-        let should_refresh = {
-            let mut state = self.state.lock().await;
-            state.subscriptions.insert(
-                instance_id.clone(),
-                Subscription {
-                    settings,
-                    key: key.clone(),
-                    setup_error,
-                },
-            );
-
-            key.as_ref().is_some_and(|key| {
-                let cache = state.caches.entry(key.clone()).or_default();
-                !cache.refreshing
-                    && cache
-                        .last_attempt
-                        .is_none_or(|last| last.elapsed() >= interval)
-            })
-        };
-
-        self.render_instance(&instance_id).await;
-
-        if should_refresh && let Some(key) = key {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                let _ = manager.refresh_key(key).await;
-            });
+        let mut state = self.state.lock().await;
+        let due = state.due_account(&subscription, Instant::now());
+        let started = due.is_some();
+        if let Some(account) = due {
+            self.refresh(account, &mut state);
+        }
+        state.tiles.insert(id.clone(), subscription);
+        drop(state);
+        if !started {
+            self.publish_tile(&id).await;
         }
     }
 
-    pub async fn unsubscribe(&self, instance_id: &str) {
-        self.state.lock().await.subscriptions.remove(instance_id);
+    pub async fn unsubscribe(&self, id: &str) {
+        self.state.lock().await.tiles.remove(id);
         self.repaint_visible().await;
     }
 
-    pub async fn force_refresh(self: &Arc<Self>, instance_id: &str) -> Result<(), AppServerError> {
-        let key = {
-            let state = self.state.lock().await;
-            let subscription = state.subscriptions.get(instance_id).ok_or_else(|| {
-                AppServerError::InvalidHome("the tile is not currently visible".into())
-            })?;
-            subscription.key.clone().ok_or_else(|| {
-                subscription
-                    .setup_error
-                    .clone()
-                    .unwrap_or_else(|| AppServerError::InvalidHome("select a CODEX_HOME".into()))
-            })?
-        };
+    pub async fn start_manual_refresh(
+        self: &Arc<Self>,
+        id: String,
+    ) -> impl Future<Output = Option<RefreshResult>> + use<> {
+        let mut state = self.state.lock().await;
+        let account = state.tiles.get(&id).map(|tile| tile.account.clone());
+        let mut pending = account
+            .as_ref()
+            .and_then(|target| target.as_ref().ok())
+            .map(|account| self.refresh(account, &mut state));
+        let manager = self.clone();
 
-        self.refresh_key(key).await
-    }
-
-    pub async fn send_status(&self, instance_id: &str) {
-        self.render_instance(instance_id).await;
-    }
-
-    async fn refresh_key(self: &Arc<Self>, key: AccountKey) -> Result<(), AppServerError> {
-        let (receiver, should_start, instance_ids) = {
-            let mut state = self.state.lock().await;
-            let cache = state.caches.entry(key.clone()).or_default();
-            let (sender, receiver) = oneshot::channel();
-            cache.waiters.push(sender);
-
-            let should_start = !cache.refreshing;
-            if should_start {
-                cache.refreshing = true;
-                cache.last_attempt = Some(Instant::now());
-                cache.error = None;
-            }
-
-            let instance_ids = if should_start {
-                subscribers_for_key(&state, &key)
-            } else {
-                Vec::new()
+        async move {
+            let account = account?;
+            let outcome = match pending.as_mut() {
+                Some(result) => result.recv().await.unwrap_or_else(|_| {
+                    Err(AppServerError::ProcessExited(
+                        "the refresh task ended unexpectedly".into(),
+                    ))
+                }),
+                None => account.as_ref().map(|_| ()).map_err(Clone::clone),
             };
-            (receiver, should_start, instance_ids)
-        };
-
-        if should_start {
-            let manager = self.clone();
-            tokio::spawn(async move {
-                // Start the owned task before yielding so cancellation of a
-                // caller cannot leave the account permanently refreshing.
-                manager.render_instances(instance_ids).await;
-                manager.perform_refresh(key).await;
-            });
+            let state = manager.state.lock().await;
+            (state.tiles.get(&id)?.account == account).then_some(outcome)
         }
-
-        receiver.await.unwrap_or_else(|_| {
-            Err(AppServerError::ProcessExited(
-                "the refresh task ended unexpectedly".into(),
-            ))
-        })
     }
 
-    async fn perform_refresh(self: Arc<Self>, key: AccountKey) {
-        let result = AppServerClient::new(key.executable.clone(), key.codex_home.clone())
-            .fetch_limits()
-            .await;
+    async fn poll_due(self: &Arc<Self>) {
+        let mut state = self.state.lock().await;
+        for account in state.due_accounts(Instant::now()) {
+            self.refresh(&account, &mut state);
+        }
+    }
 
-        let (instance_ids, waiters, waiter_result) = {
-            let mut state = self.state.lock().await;
-            let (waiters, waiter_result) = {
-                let cache = state.caches.entry(key.clone()).or_default();
-                cache.refreshing = false;
+    fn refresh(
+        self: &Arc<Self>,
+        account: &AppServerClient,
+        state: &mut ManagerState,
+    ) -> broadcast::Receiver<RefreshResult> {
+        let cache = state.accounts.entry(account.clone()).or_default();
+        if let Some(result) = cache.active_request() {
+            return result.resubscribe();
+        }
+        let (sender, receiver) = broadcast::channel(1);
+        cache.refresh = Refresh::Running(receiver.resubscribe());
+        cache.last_attempt = Some(Instant::now());
 
-                let waiter_result = match result {
+        let manager = self.clone();
+        let account = account.clone();
+        tokio::spawn(async move {
+            manager.publish_account(&account).await;
+            let result = account.fetch_limits().await;
+            let outcome = {
+                let mut state = manager.state.lock().await;
+                let cache = state.accounts.get_mut(&account).expect("active account");
+                match result {
                     Ok(snapshot) => {
-                        cache.snapshot = Some(snapshot);
-                        cache.last_success = Some(SystemTime::now());
-                        cache.error = None;
+                        cache.reading = Some((snapshot, SystemTime::now()));
+                        cache.refresh = Refresh::Idle;
                         Ok(())
                     }
                     Err(error) => {
-                        cache.error = Some(error.clone());
+                        cache.refresh = Refresh::Failed(error.clone());
                         Err(error)
                     }
-                };
-                (std::mem::take(&mut cache.waiters), waiter_result)
+                }
             };
+            manager.publish_account(&account).await;
+            let _ = sender.send(outcome);
+        });
+        receiver
+    }
 
-            (subscribers_for_key(&state, &key), waiters, waiter_result)
-        };
-
-        self.render_instances(instance_ids).await;
-        for waiter in waiters {
-            let _ = waiter.send(waiter_result.clone());
+    async fn publish_account(&self, account: &AppServerClient) {
+        let ids = self.state.lock().await.subscribers(account);
+        for id in ids {
+            self.publish_tile(&id).await;
         }
     }
 
-    async fn due_keys(&self) -> Vec<AccountKey> {
-        let state = self.state.lock().await;
-        let mut intervals: HashMap<&AccountKey, Duration> = HashMap::new();
-
-        for subscription in state.subscriptions.values() {
-            let Some(key) = subscription.key.as_ref() else {
-                continue;
-            };
-            let interval = refresh_interval(&subscription.settings);
-            intervals
-                .entry(key)
-                .and_modify(|current| *current = (*current).min(interval))
-                .or_insert(interval);
-        }
-
-        intervals
-            .into_iter()
-            .filter_map(|(key, interval)| {
-                let cache = state.caches.get(key);
-                let due = cache.is_none_or(|cache| {
-                    !cache.refreshing
-                        && cache
-                            .last_attempt
-                            .is_none_or(|last| last.elapsed() >= interval)
-                });
-                due.then(|| key.clone())
-            })
-            .collect()
-    }
-
-    async fn render_instances(&self, instance_ids: Vec<String>) {
-        for instance_id in instance_ids {
-            self.render_instance(&instance_id).await;
-        }
+    pub async fn publish_tile(&self, id: &str) {
+        self.publish(id, true).await;
     }
 
     async fn repaint_visible(&self) {
-        let instance_ids = {
-            let state = self.state.lock().await;
-            state.subscriptions.keys().cloned().collect::<Vec<_>>()
-        };
-
-        for instance_id in instance_ids {
-            self.repaint_instance(&instance_id).await;
+        let ids: Vec<_> = self.state.lock().await.tiles.keys().cloned().collect();
+        for id in ids {
+            self.publish(&id, false).await;
         }
     }
 
-    async fn repaint_instance(&self, instance_id: &str) {
-        let Some((view, _)) = self.view_and_status(instance_id).await else {
+    async fn publish(&self, id: &str, include_status: bool) {
+        let _publishing = self.publication.lock().await;
+        let Some(instance) = get_instance(id.to_owned()).await else {
             return;
         };
-        self.set_tile_image(instance_id, &view).await;
-    }
-
-    async fn render_instance(&self, instance_id: &str) {
-        let Some((view, status)) = self.view_and_status(instance_id).await else {
+        let Some(tile) = self.state.lock().await.presentation(id) else {
             return;
         };
-
-        self.set_tile_image(instance_id, &view).await;
-
-        let Some(instance) = get_instance(instance_id.to_owned()).await else {
-            return;
-        };
-
-        if let Err(error) = instance.send_to_property_inspector(status).await {
-            log::debug!("Property inspector is unavailable for {instance_id}: {error}");
-        }
-    }
-
-    async fn set_tile_image(&self, instance_id: &str, view: &TileView) {
-        let Some(instance) = get_instance(instance_id.to_owned()).await else {
-            return;
-        };
-
-        match render_data_uri(view) {
-            Ok(image) => {
-                if let Err(error) = instance.set_image(Some(image), None).await {
-                    log::error!("Failed to update tile {instance_id}: {error}");
-                }
-            }
-            Err(error) => log::error!("Failed to render tile {instance_id}: {error}"),
-        }
-    }
-
-    async fn view_and_status(&self, instance_id: &str) -> Option<(TileView, InspectorStatus)> {
-        let state = self.state.lock().await;
-        let subscription = state.subscriptions.get(instance_id)?;
-        let label = subscription.settings.effective_label();
-
-        let Some(key) = &subscription.key else {
-            if subscription.settings.codex_home.trim().is_empty() {
-                return Some((
-                    TileView::Unconfigured,
-                    status("unconfigured", "Select a CODEX_HOME", None),
-                ));
-            }
-            let error = subscription.setup_error.as_ref()?;
-            return Some((
-                TileView::Error {
-                    label,
-                    message: error.tile_label().into(),
-                },
-                status("error", error.to_string(), None),
-            ));
-        };
-
-        let cache = state.caches.get(key);
-        match cache {
-            None => Some((
-                TileView::Loading { label },
-                status("loading", "Waiting for first refresh", None),
-            )),
-            Some(cache) => {
-                let refreshed_at = cache.last_success.and_then(unix_seconds);
-                match (&cache.snapshot, &cache.error) {
-                    (Some(snapshot), error) => {
-                        let stale = error.is_some();
-                        let message = if cache.refreshing {
-                            "Refreshing".to_owned()
-                        } else if let Some(error) = error {
-                            format!("Stale: {error}")
-                        } else {
-                            "Up to date".to_owned()
-                        };
-                        let state_name = if cache.refreshing {
-                            "refreshing"
-                        } else if stale {
-                            "stale"
-                        } else {
-                            "ready"
-                        };
-                        Some((
-                            TileView::Limits {
-                                label,
-                                windows: snapshot.windows.clone(),
-                                reset_credits: snapshot.reset_credits.clone(),
-                                refreshing: cache.refreshing,
-                                stale,
-                            },
-                            status(state_name, &message, refreshed_at),
-                        ))
-                    }
-                    (None, Some(error)) => Some((
-                        TileView::Error {
-                            label,
-                            message: error.tile_label().into(),
-                        },
-                        status("error", error.to_string(), refreshed_at),
-                    )),
-                    (None, None) => Some((
-                        TileView::Loading { label },
-                        status("loading", "Fetching limits", refreshed_at),
-                    )),
-                }
-            }
-        }
+        tile.send(&instance, include_status).await;
     }
 }
 
-fn status(
-    state: &'static str,
-    message: impl Into<String>,
-    refreshed_at: Option<u64>,
-) -> InspectorStatus {
-    InspectorStatus {
-        event: "status",
-        state,
-        message: message.into(),
-        refreshed_at,
-    }
-}
-
-fn subscribers_for_key(state: &ManagerState, key: &AccountKey) -> Vec<String> {
-    state
-        .subscriptions
-        .iter()
-        .filter_map(|(instance_id, subscription)| {
-            (subscription.key.as_ref() == Some(key)).then_some(instance_id.clone())
-        })
-        .collect()
-}
-
-fn refresh_interval(settings: &TileSettings) -> Duration {
-    Duration::from_secs(settings.refresh_interval_minutes() * 60)
-}
-
-pub fn account_key(settings: &TileSettings) -> Result<AccountKey, AppServerError> {
-    let raw_home = settings.codex_home.trim();
-    if raw_home.is_empty() {
-        return Err(AppServerError::InvalidHome("select a CODEX_HOME".into()));
-    }
-
-    let expanded = expand_tilde(raw_home)?;
-    let canonical = expanded
-        .canonicalize()
-        .map_err(|_| AppServerError::InvalidHome(expanded.to_string_lossy().into_owned()))?;
-    if !canonical.is_dir() {
-        return Err(AppServerError::InvalidHome(
-            canonical.to_string_lossy().into_owned(),
-        ));
-    }
-
-    let executable = settings.codex_executable.trim();
-    if executable.is_empty() {
-        return Err(AppServerError::CodexNotFound(
-            "the executable setting is empty".into(),
-        ));
-    }
-
-    Ok(AccountKey {
-        codex_home: canonical,
-        executable: executable.to_owned(),
-    })
-}
-
-fn expand_tilde(value: &str) -> Result<PathBuf, AppServerError> {
-    if value == "~" || value.starts_with("~/") {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| AppServerError::InvalidHome("HOME is not set".into()))?;
-        if value == "~" {
-            Ok(home)
-        } else {
-            Ok(home.join(&value[2..]))
-        }
-    } else {
-        Ok(PathBuf::from(value))
-    }
-}
-
-fn unix_seconds(time: SystemTime) -> Option<u64> {
-    time.duration_since(UNIX_EPOCH)
-        .ok()
-        .map(|value| value.as_secs())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
-    use super::*;
-
-    fn counting_codex(directory: &std::path::Path) -> (PathBuf, PathBuf) {
-        let executable = directory.join("counting-codex");
-        let counter = directory.join("requests");
-        let script = format!(
-            r#"#!/bin/sh
-IFS= read -r initialize
-printf '%s\n' '{{"id":0,"result":{{"userAgent":"fake"}}}}'
-IFS= read -r initialized
-IFS= read -r request
-sleep 0.05
-count=0
-if [ -f "{counter}" ]; then
-  IFS= read -r count < "{counter}"
-fi
-count=$((count + 1))
-printf '%s\n' "$count" > "{counter}"
-printf '%s\n' '{{"id":2,"result":{{"rateLimits":{{"limitId":"codex","primary":{{"usedPercent":12,"windowDurationMins":300}}}}}}}}'
-"#,
-            counter = counter.display()
-        );
-        std::fs::write(&executable, script).unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-        (executable, counter)
-    }
-
-    async fn wait_for_count(counter: &std::path::Path, expected: u64) {
-        for _ in 0..100 {
-            let count = std::fs::read_to_string(counter)
-                .ok()
-                .and_then(|value| value.trim().parse::<u64>().ok())
-                .unwrap_or(0);
-            if count >= expected {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        panic!("counter did not reach {expected}");
-    }
-
-    #[test]
-    fn canonicalizes_and_keys_account_settings() {
-        let directory = tempfile::tempdir().unwrap();
-        let settings = TileSettings {
-            codex_home: directory.path().to_string_lossy().into_owned(),
-            codex_executable: "/usr/bin/codex".into(),
-            ..TileSettings::default()
-        };
-        let key = account_key(&settings).unwrap();
-        assert_eq!(key.codex_home, directory.path().canonicalize().unwrap());
-        assert_eq!(key.executable, "/usr/bin/codex");
-    }
-
-    #[test]
-    fn rejects_missing_homes() {
-        let settings = TileSettings {
-            codex_home: "/definitely/not/a/codex/home".into(),
-            ..TileSettings::default()
-        };
-        assert!(matches!(
-            account_key(&settings),
-            Err(AppServerError::InvalidHome(_))
-        ));
-    }
-
-    #[tokio::test]
-    async fn shared_tiles_use_one_in_flight_request_and_clicks_are_single_flight() {
-        let directory = tempfile::tempdir().unwrap();
-        let (executable, counter) = counting_codex(directory.path());
-        let settings = TileSettings {
-            codex_home: directory.path().to_string_lossy().into_owned(),
-            codex_executable: executable.to_string_lossy().into_owned(),
-            ..TileSettings::default()
-        };
-        let manager = AccountManager::new();
-
-        manager.subscribe("tile-a".into(), settings.clone()).await;
-        manager.subscribe("tile-b".into(), settings).await;
-        wait_for_count(&counter, 1).await;
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
-
-        // Repainting cached tiles after an OpenDeck layout redraw must not
-        // produce another app-server request.
-        manager.repaint_visible().await;
-        manager.repaint_visible().await;
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "1");
-
-        let (left, right) = tokio::join!(
-            manager.force_refresh("tile-a"),
-            manager.force_refresh("tile-b")
-        );
-        left.unwrap();
-        right.unwrap();
-        wait_for_count(&counter, 2).await;
-        assert_eq!(std::fs::read_to_string(&counter).unwrap().trim(), "2");
-    }
-
-    #[tokio::test]
-    #[ignore = "manual release-mode performance measurement"]
-    async fn benchmark_polling() {
-        let manager = AccountManager::new();
-        {
-            let mut state = manager.state.lock().await;
-            for index in 0..32 {
-                let key = AccountKey {
-                    codex_home: PathBuf::from(format!("/synthetic/account-{}", index % 4)),
-                    executable: "codex".into(),
-                };
-                state
-                    .caches
-                    .entry(key.clone())
-                    .or_insert_with(|| CacheEntry {
-                        last_attempt: Some(Instant::now()),
-                        ..CacheEntry::default()
-                    });
-                state.subscriptions.insert(
-                    index.to_string(),
-                    Subscription {
-                        settings: TileSettings::default(),
-                        key: Some(key),
-                        setup_error: None,
-                    },
-                );
-            }
-        }
-        let mut samples = Vec::new();
-        for _ in 0..7 {
-            let start = Instant::now();
-            for _ in 0..10_000 {
-                std::hint::black_box(manager.due_keys().await);
-            }
-            samples.push(start.elapsed().as_nanos() / 10_000);
-        }
-        samples.sort_unstable();
-        println!(
-            "poll 32 tiles / 4 accounts: {} ns/pass (median of 7 samples)",
-            samples[3]
-        );
-    }
-
-    #[tokio::test]
-    async fn polling_uses_the_shortest_visible_interval_and_skips_in_flight_accounts() {
-        let manager = AccountManager::new();
-        let key = AccountKey {
-            codex_home: PathBuf::from("/synthetic/home"),
-            executable: "codex".into(),
-        };
-        {
-            let mut state = manager.state.lock().await;
-            for (instance_id, refresh_minutes) in [("fast", 1), ("slow", 5)] {
-                state.subscriptions.insert(
-                    instance_id.into(),
-                    Subscription {
-                        settings: TileSettings {
-                            refresh_minutes,
-                            ..TileSettings::default()
-                        },
-                        key: Some(key.clone()),
-                        setup_error: None,
-                    },
-                );
-            }
-            state.caches.insert(
-                key.clone(),
-                CacheEntry {
-                    last_attempt: Some(Instant::now() - Duration::from_secs(120)),
-                    ..CacheEntry::default()
-                },
-            );
-        }
-
-        assert_eq!(manager.due_keys().await, vec![key.clone()]);
-        manager
-            .state
-            .lock()
-            .await
-            .caches
-            .get_mut(&key)
-            .unwrap()
-            .refreshing = true;
-        assert!(manager.due_keys().await.is_empty());
-        manager
-            .state
-            .lock()
-            .await
-            .caches
-            .get_mut(&key)
-            .unwrap()
-            .refreshing = false;
-
-        manager.unsubscribe("fast").await;
-        assert!(manager.due_keys().await.is_empty());
-        manager
-            .state
-            .lock()
-            .await
-            .caches
-            .get_mut(&key)
-            .unwrap()
-            .last_attempt = None;
-        assert_eq!(manager.due_keys().await, vec![key]);
-        manager.unsubscribe("slow").await;
-        assert!(manager.due_keys().await.is_empty());
-    }
-
-    #[tokio::test]
-    async fn cancelling_a_waiter_does_not_cancel_the_shared_refresh() {
-        let directory = tempfile::tempdir().unwrap();
-        let (executable, counter) = counting_codex(directory.path());
-        let manager = AccountManager::new();
-        let key = AccountKey {
-            codex_home: directory.path().to_owned(),
-            executable: executable.to_string_lossy().into_owned(),
-        };
-
-        // Poll once to start the worker, then drop the caller at its first wait.
-        let mut request = Box::pin(manager.refresh_key(key.clone()));
-        std::future::poll_fn(|context| {
-            assert!(request.as_mut().poll(context).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        drop(request);
-
-        tokio::time::timeout(Duration::from_secs(2), manager.refresh_key(key.clone()))
-            .await
-            .expect("the shared worker should finish after its caller is cancelled")
-            .unwrap();
-        assert_eq!(std::fs::read_to_string(counter).unwrap().trim(), "1");
-        let state = manager.state.lock().await;
-        let cache = state.caches.get(&key).unwrap();
-        assert!(!cache.refreshing);
-        assert!(cache.snapshot.is_some());
-        assert!(cache.waiters.is_empty());
-    }
-
-    #[tokio::test]
-    async fn settings_changes_move_a_tile_between_accounts() {
-        let directory = tempfile::tempdir().unwrap();
-        let first_home = directory.path().join("first");
-        let second_home = directory.path().join("second");
-        std::fs::create_dir(&first_home).unwrap();
-        std::fs::create_dir(&second_home).unwrap();
-
-        let first_settings = TileSettings {
-            codex_home: first_home.to_string_lossy().into_owned(),
-            codex_executable: "/definitely/missing/codex".into(),
-            ..TileSettings::default()
-        };
-        let second_settings = TileSettings {
-            codex_home: second_home.to_string_lossy().into_owned(),
-            ..first_settings.clone()
-        };
-        let first_key = account_key(&first_settings).unwrap();
-        let second_key = account_key(&second_settings).unwrap();
-        let manager = AccountManager::new();
-
-        manager
-            .subscribe("moving-tile".into(), first_settings)
-            .await;
-        manager
-            .subscribe("moving-tile".into(), second_settings)
-            .await;
-
-        let state = manager.state.lock().await;
-        assert!(subscribers_for_key(&state, &first_key).is_empty());
-        assert_eq!(
-            subscribers_for_key(&state, &second_key),
-            vec!["moving-tile"]
-        );
-    }
+fn periodic(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    interval
 }

@@ -1,24 +1,20 @@
-use std::io::ErrorKind;
+mod protocol;
+
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
 
-use serde::Serialize;
 use serde_json::{Value, json};
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::task::JoinSet;
-use tokio::time::timeout;
 
-use crate::model::{NormalizeError, UsageSnapshot, normalize_usage_snapshot};
+use crate::settings::TileSettings;
+use crate::usage::{NormalizeError, UsageSnapshot, normalize_usage_snapshot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_millis(100);
-const STDERR_LIMIT: usize = 8 * 1024;
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum AppServerError {
+    #[error("CODEX_HOME is invalid: select a CODEX_HOME")]
+    HomeNotSelected,
     #[error("CODEX_HOME is invalid: {0}")]
     InvalidHome(String),
     #[error("the Codex executable was not found: {0}")]
@@ -39,29 +35,7 @@ pub enum AppServerError {
     Upstream(String),
 }
 
-impl AppServerError {
-    pub fn tile_label(&self) -> &'static str {
-        match self {
-            Self::InvalidHome(_) => "Bad home",
-            Self::CodexNotFound(_) => "Codex missing",
-            Self::NotAuthenticated => "Sign in",
-            Self::MethodUnavailable => "Update Codex",
-            Self::Timeout | Self::Upstream(_) => "Offline",
-            Self::ProcessExited(_) | Self::Protocol(_) | Self::EmptyRateLimits => "Unavailable",
-        }
-    }
-}
-
-#[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AccountIdentity {
-    pub codex_home: String,
-    pub email: Option<String>,
-    pub plan_type: Option<String>,
-    pub signed_in: bool,
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AppServerClient {
     executable: String,
     codex_home: PathBuf,
@@ -75,409 +49,161 @@ impl AppServerClient {
         }
     }
 
+    pub fn from_settings(settings: &TileSettings) -> Result<Self, AppServerError> {
+        let home = settings.codex_home.trim();
+        if home.is_empty() {
+            return Err(AppServerError::HomeNotSelected);
+        }
+        let path = match home
+            .strip_prefix("~/")
+            .or_else(|| (home == "~").then_some(""))
+        {
+            Some(rest) => PathBuf::from(
+                std::env::var_os("HOME")
+                    .ok_or_else(|| AppServerError::InvalidHome("HOME is not set".into()))?,
+            )
+            .join(rest),
+            None => PathBuf::from(home),
+        };
+        let home = canonical_home(&path)?;
+        let executable = settings.codex_executable.trim();
+        if executable.is_empty() {
+            return Err(AppServerError::CodexNotFound(
+                "the executable setting is empty".into(),
+            ));
+        }
+        Ok(Self::new(executable, home))
+    }
+
     pub async fn fetch_limits(&self) -> Result<UsageSnapshot, AppServerError> {
-        let value = self.request("account/rateLimits/read", 2, None).await?;
+        let value = self
+            .request("account/rateLimits/read", None, REQUEST_TIMEOUT)
+            .await?;
         normalize_usage_snapshot(&value).map_err(|error| match error {
             NormalizeError::MissingSnapshot => AppServerError::EmptyRateLimits,
             NormalizeError::InvalidResponse(message) => AppServerError::Protocol(message),
         })
     }
 
-    pub async fn fetch_identity(&self) -> Result<AccountIdentity, AppServerError> {
-        let value = self
-            .request("account/read", 3, Some(json!({ "refreshToken": false })))
-            .await?;
-        let result = value.get("result").unwrap_or(&value);
-        let account = result.get("account").filter(|account| !account.is_null());
-
-        Ok(AccountIdentity {
-            codex_home: self.codex_home.to_string_lossy().into_owned(),
-            email: account
-                .and_then(|account| account.get("email"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            plan_type: account
-                .and_then(|account| account.get("planType"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            signed_in: account.is_some(),
-        })
-    }
-
-    async fn request(
-        &self,
-        method: &str,
-        id: u64,
-        params: Option<Value>,
-    ) -> Result<Value, AppServerError> {
-        self.request_with_timeout(method, id, params, REQUEST_TIMEOUT)
-            .await
-    }
-
-    async fn request_with_timeout(
-        &self,
-        method: &str,
-        id: u64,
-        params: Option<Value>,
-        request_timeout: Duration,
-    ) -> Result<Value, AppServerError> {
-        validate_home(&self.codex_home)?;
-
-        let mut child = Command::new(&self.executable)
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", &self.codex_home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .spawn()
-            .map_err(|error| {
-                if error.kind() == ErrorKind::NotFound {
-                    AppServerError::CodexNotFound(self.executable.clone())
-                } else {
-                    AppServerError::ProcessExited(error.to_string())
-                }
-            })?;
-
-        let stderr = child.stderr.take().expect("piped stderr");
-        // Dropping the set also cancels the reader if this request is cancelled.
-        let mut stderr_tasks = JoinSet::new();
-        stderr_tasks.spawn(read_stderr_tail(stderr));
-
-        let result = timeout(request_timeout, exchange(&mut child, method, id, params)).await;
-
-        let response = match result {
-            Ok(response) => response,
-            Err(_) => Err(AppServerError::Timeout),
-        };
-
-        cleanup_child(&mut child).await;
-        // A descendant can retain stderr after the app-server exits. Diagnostics
-        // must not keep a completed or timed-out request waiting indefinitely.
-        let stderr = match timeout(STDERR_DRAIN_TIMEOUT, stderr_tasks.join_next()).await {
-            Ok(Some(Ok(stderr))) => stderr,
-            _ => String::new(),
-        };
-
-        response.map_err(|error| match error {
-            AppServerError::ProcessExited(message) if !stderr.is_empty() => {
-                AppServerError::ProcessExited(format!("{message}: {stderr}"))
-            }
-            other => other,
-        })
-    }
-}
-
-async fn read_stderr_tail(mut stderr: impl tokio::io::AsyncRead + Unpin) -> String {
-    let mut tail = Vec::with_capacity(STDERR_LIMIT);
-    let mut chunk = [0_u8; 1_024];
-
-    loop {
-        let count = match stderr.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(count) => count,
-        };
-
-        let overflow = tail
-            .len()
-            .saturating_add(count)
-            .saturating_sub(STDERR_LIMIT);
-        if overflow > 0 {
-            tail.drain(..overflow);
-        }
-        tail.extend_from_slice(&chunk[..count]);
-    }
-
-    String::from_utf8_lossy(&tail).trim().to_owned()
-}
-
-pub fn validate_home(path: &Path) -> Result<(), AppServerError> {
-    if !path.is_dir() {
-        return Err(AppServerError::InvalidHome(
-            path.to_string_lossy().into_owned(),
-        ));
-    }
-    Ok(())
-}
-
-async fn exchange(
-    child: &mut Child,
-    method: &str,
-    id: u64,
-    params: Option<Value>,
-) -> Result<Value, AppServerError> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| AppServerError::Protocol("app-server stdin was unavailable".into()))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| AppServerError::Protocol("app-server stdout was unavailable".into()))?;
-    let mut lines = BufReader::new(stdout).lines();
-
-    send(
-        &mut stdin,
-        &json!({
-            "method": "initialize",
-            "id": 0,
-            "params": {
-                "clientInfo": {
-                    "name": "codex_limits_opendeck",
-                    "title": "Codex Limits for OpenDeck",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        }),
-    )
-    .await?;
-
-    let initialization = wait_for_id(&mut lines, 0).await?;
-    ensure_success(&initialization)?;
-
-    send(
-        &mut stdin,
-        &json!({ "method": "initialized", "params": {} }),
-    )
-    .await?;
-
-    let mut request = json!({ "method": method, "id": id });
-    if let Some(params) = params {
-        request["params"] = params;
-    }
-    send(&mut stdin, &request).await?;
-
-    let response = wait_for_id(&mut lines, id).await?;
-    ensure_success(&response)?;
-    drop(stdin);
-    Ok(response)
-}
-
-async fn send(stdin: &mut tokio::process::ChildStdin, value: &Value) -> Result<(), AppServerError> {
-    let mut bytes =
-        serde_json::to_vec(value).map_err(|error| AppServerError::Protocol(error.to_string()))?;
-    bytes.push(b'\n');
-    stdin
-        .write_all(&bytes)
+    pub async fn read_account(&self) -> Result<Value, AppServerError> {
+        self.request(
+            "account/read",
+            Some(json!({ "refreshToken": false })),
+            REQUEST_TIMEOUT,
+        )
         .await
-        .map_err(|error| AppServerError::ProcessExited(error.to_string()))?;
-    stdin
-        .flush()
-        .await
-        .map_err(|error| AppServerError::ProcessExited(error.to_string()))
+    }
 }
 
-async fn wait_for_id(
-    lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>,
-    expected: u64,
-) -> Result<Value, AppServerError> {
-    while let Some(line) = lines
-        .next_line()
-        .await
-        .map_err(|error| AppServerError::Protocol(error.to_string()))?
-    {
-        let value: Value = serde_json::from_str(&line)
-            .map_err(|error| AppServerError::Protocol(error.to_string()))?;
-        if value.get("id").and_then(Value::as_u64) == Some(expected) {
-            return Ok(value);
-        }
-    }
-
-    Err(AppServerError::ProcessExited(
-        "stdout closed before a response arrived".into(),
-    ))
+pub fn canonical_home(path: &Path) -> Result<PathBuf, AppServerError> {
+    let home = path
+        .canonicalize()
+        .map_err(|_| AppServerError::InvalidHome(path.display().to_string()))?;
+    validate_home(&home)?;
+    Ok(home)
 }
 
-fn ensure_success(value: &Value) -> Result<(), AppServerError> {
-    let Some(error) = value.get("error") else {
-        return Ok(());
-    };
-
-    let code = error.get("code").and_then(Value::as_i64);
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown app-server error");
-    let lower = message.to_ascii_lowercase();
-
-    if code == Some(-32601) || lower.contains("method not found") {
-        return Err(AppServerError::MethodUnavailable);
+fn validate_home(path: &Path) -> Result<(), AppServerError> {
+    if path.is_dir() {
+        Ok(())
+    } else {
+        Err(AppServerError::InvalidHome(path.display().to_string()))
     }
-    if lower.contains("unauthorized")
-        || lower.contains("not logged")
-        || lower.contains("authentication")
-        || lower.contains("sign in")
-    {
-        return Err(AppServerError::NotAuthenticated);
-    }
-
-    Err(AppServerError::Upstream(message.to_owned()))
-}
-
-async fn cleanup_child(child: &mut Child) {
-    if matches!(child.try_wait(), Ok(None)) {
-        let _ = child.kill().await;
-    }
-    let _ = child.wait().await;
 }
 
 #[cfg(test)]
+pub const FAKE_CODEX: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/fake-codex.sh");
+
+#[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use tokio::time::timeout;
 
     use super::*;
 
-    fn fake_codex(directory: &Path) -> PathBuf {
-        let executable = directory.join("fake-codex");
-        std::fs::write(
-            &executable,
-            r#"#!/bin/sh
-IFS= read -r initialize
-printf '%s\n' '{"id":0,"result":{"userAgent":"fake"}}'
-IFS= read -r initialized
-IFS= read -r request
-case "$request" in
-  *account/rateLimits/read*)
-    printf '%s\n' '{"id":2,"result":{"rateLimits":{"limitId":"codex","primary":{"usedPercent":12,"windowDurationMins":300},"secondary":{"usedPercent":34,"windowDurationMins":10080}},"rateLimitResetCredits":{"availableCount":2,"credits":[{"status":"available","expiresAt":1784246400}]}}}'
-    ;;
-  *account/read*)
-    printf '%s\n' '{"id":3,"result":{"account":{"type":"chatgpt","email":"test@example.com","planType":"plus"},"requiresOpenaiAuth":true}}'
-    ;;
-esac
-"#,
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-        executable
-    }
-
-    fn hanging_codex(directory: &Path) -> (PathBuf, PathBuf) {
-        let executable = directory.join("hanging-codex");
-        let pid_file = directory.join("child.pid");
-        std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$$\" > '{}'\nexec sleep 30\n",
-                pid_file.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).unwrap();
-        (executable, pid_file)
-    }
-
-    #[tokio::test]
-    async fn completes_the_initialize_and_rate_limit_exchange() {
+    #[test]
+    fn resolves_settings_to_a_canonical_endpoint() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = fake_codex(directory.path());
-        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
-
-        let snapshot = client.fetch_limits().await.unwrap();
-        assert_eq!(snapshot.windows.len(), 2);
-        assert_eq!(snapshot.windows[0].remaining_percent, 88);
-        assert_eq!(snapshot.windows[1].remaining_percent, 66);
-        assert_eq!(snapshot.reset_credits.unwrap().available_count, 2);
+        let home = directory.path().join("home");
+        let alias = directory.path().join("alias");
+        fs::create_dir(&home).unwrap();
+        symlink(&home, &alias).unwrap();
+        let settings = TileSettings {
+            codex_executable: " /usr/bin/codex ".into(),
+            codex_home: format!(" {} ", alias.display()),
+            ..TileSettings::default()
+        };
+        assert_eq!(
+            AppServerClient::from_settings(&settings).unwrap(),
+            AppServerClient::new("/usr/bin/codex", home.canonicalize().unwrap())
+        );
+        fs::remove_dir(&home).unwrap();
+        assert!(matches!(
+            AppServerClient::from_settings(&settings),
+            Err(AppServerError::InvalidHome(_))
+        ));
+        assert_eq!(
+            AppServerClient::from_settings(&TileSettings::default()),
+            Err(AppServerError::HomeNotSelected)
+        );
     }
 
     #[tokio::test]
-    async fn reads_account_identity_without_persisting_it() {
+    async fn reads_limits_even_when_a_descendant_keeps_stderr_open() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = fake_codex(directory.path());
-        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
-
-        let identity = client.fetch_identity().await.unwrap();
-        assert!(identity.signed_in);
-        assert_eq!(identity.email.as_deref(), Some("test@example.com"));
-        assert_eq!(identity.plan_type.as_deref(), Some("plus"));
-    }
-
-    #[tokio::test]
-    async fn keeps_only_the_bounded_stderr_tail() {
-        let (mut writer, reader) = tokio::io::duplex(16 * 1024);
-        let writer_task = tokio::spawn(async move {
-            writer.write_all(b"discard-this-prefix\n").await.unwrap();
-            writer.write_all(&vec![b'x'; STDERR_LIMIT]).await.unwrap();
-            writer.write_all(b"\nkeep-this-suffix").await.unwrap();
-        });
-
-        let tail = read_stderr_tail(reader).await;
-        writer_task.await.unwrap();
-
-        assert!(tail.len() <= STDERR_LIMIT);
-        assert!(!tail.contains("discard-this-prefix"));
-        assert!(tail.ends_with("keep-this-suffix"));
-    }
-
-    #[tokio::test]
-    async fn inherited_stderr_does_not_block_a_successful_response() {
-        let directory = tempfile::tempdir().unwrap();
-        let executable = fake_codex(directory.path());
-        let script = std::fs::read_to_string(&executable).unwrap();
-        std::fs::write(
-            &executable,
-            script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 2 &\n", 1),
-        )
-        .unwrap();
-        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
-
+        fs::write(directory.path().join("inherit-stderr"), "").unwrap();
+        let client = AppServerClient::new(FAKE_CODEX, directory.path());
         let snapshot = timeout(Duration::from_secs(1), client.fetch_limits())
             .await
             .expect("an inherited stderr pipe must not block the response")
             .unwrap();
-        assert_eq!(snapshot.windows[0].remaining_percent, 88);
+        assert_eq!(
+            snapshot
+                .windows
+                .iter()
+                .map(|w| w.remaining_percent)
+                .collect::<Vec<_>>(),
+            [88, 66]
+        );
+        assert_eq!(snapshot.reset_credits.unwrap().available_count, 2);
     }
 
     #[tokio::test]
-    async fn inherited_stderr_does_not_block_a_timeout() {
+    async fn reports_the_tail_of_diagnostics_after_an_early_exit() {
         let directory = tempfile::tempdir().unwrap();
-        let (executable, pid_file) = hanging_codex(directory.path());
-        let script = std::fs::read_to_string(&executable).unwrap();
-        std::fs::write(
-            &executable,
-            script.replacen("#!/bin/sh\n", "#!/bin/sh\nsleep 2 &\n", 1),
-        )
-        .unwrap();
-        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
+        let diagnostic = format!("discard this {} keep this", "x".repeat(10000));
+        fs::write(directory.path().join("stderr"), diagnostic).unwrap();
+        let client = AppServerClient::new(FAKE_CODEX, directory.path());
+        let Err(AppServerError::ProcessExited(message)) = client.fetch_limits().await else {
+            panic!("an early exit should include stderr");
+        };
+        assert!(!message.contains("discard this"));
+        assert!(message.ends_with("keep this"));
+        assert_eq!(message.split_once(": ").unwrap().1.len(), 8 * 1024);
+    }
 
+    #[tokio::test]
+    async fn reaps_the_child_on_timeout_even_when_a_descendant_inherits_stderr() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("inherit-stderr"), "").unwrap();
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(directory.path().join("release"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        let client = AppServerClient::new(FAKE_CODEX, directory.path());
         let error = timeout(
             Duration::from_secs(1),
-            client.request_with_timeout(
-                "account/rateLimits/read",
-                2,
-                None,
-                Duration::from_millis(300),
-            ),
+            client.request("account/rateLimits/read", None, Duration::from_millis(300)),
         )
         .await
-        .expect("an inherited stderr pipe must not defeat the request timeout")
+        .expect("stderr must not defeat the timeout")
         .unwrap_err();
         assert_eq!(error, AppServerError::Timeout);
-        let pid = std::fs::read_to_string(pid_file).unwrap();
-        assert!(!Path::new("/proc").join(pid.trim()).exists());
-    }
-
-    #[tokio::test]
-    async fn times_out_and_reaps_the_app_server_child() {
-        let directory = tempfile::tempdir().unwrap();
-        let (executable, pid_file) = hanging_codex(directory.path());
-        let client = AppServerClient::new(executable.to_string_lossy(), directory.path());
-
-        let error = client
-            .request_with_timeout(
-                "account/rateLimits/read",
-                2,
-                None,
-                Duration::from_millis(300),
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error, AppServerError::Timeout);
-
-        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let pid = fs::read_to_string(directory.path().join("requests")).unwrap();
         assert!(!Path::new("/proc").join(pid.trim()).exists());
     }
 
@@ -485,10 +211,9 @@ esac
     #[ignore = "requires a signed-in local CODEX_HOME and real Codex CLI"]
     async fn reads_live_rate_limits() {
         let home = std::env::var("CODEX_HOME").expect("set CODEX_HOME for this test");
-        let snapshot = AppServerClient::new("codex", home)
+        AppServerClient::new("codex", home)
             .fetch_limits()
             .await
             .unwrap();
-        assert!(snapshot.windows.len() <= 2);
     }
 }

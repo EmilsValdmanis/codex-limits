@@ -1,8 +1,6 @@
 :root {
   color-scheme: dark;
   --sdpi-bgcolor: #2d2d2d;
-  --sdpi-background: #3d3d3d;
-  --sdpi-bordercolor: #5a5a5a;
   --sdpi-buttonbordercolor: #969696;
   --sdpi-color: #d8d8d8;
   --sdpi-labelcolor: #969696;
@@ -157,10 +155,6 @@ button:focus-visible {
   align-items: start;
   gap: 7px;
   padding-top: 4px;
-}
-
-.connection-led {
-  display: none;
 }
 
 .status-dot {

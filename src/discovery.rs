@@ -1,207 +1,199 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use serde::Serialize;
+use serde_json::Value;
 use tokio::task::JoinSet;
 
-use crate::app_server::{AccountIdentity, AppServerClient};
+use crate::app_server::{AppServerClient, canonical_home};
 
 const MAX_CONCURRENT_DISCOVERIES: usize = 4;
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountIdentity {
+    codex_home: String,
+    email: Option<String>,
+    plan_type: Option<String>,
+    signed_in: bool,
+}
+
+impl AccountIdentity {
+    async fn discover(executable: String, home: PathBuf) -> Self {
+        let codex_home = home.display().to_string();
+        let result = AppServerClient::new(executable, home)
+            .read_account()
+            .await
+            .ok();
+        let account = result
+            .as_ref()
+            .and_then(|value| value.get("account"))
+            .filter(|account| !account.is_null());
+        let field = |key| {
+            account
+                .and_then(|value| value.get(key))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        Self {
+            codex_home,
+            email: field("email"),
+            plan_type: field("planType"),
+            signed_in: account.is_some(),
+        }
+    }
+}
+
 pub async fn discover_accounts(executable: &str) -> Vec<AccountIdentity> {
-    discover_homes(executable, candidate_homes()).await
+    let inherited = std::env::var_os("CODEX_HOME").map(PathBuf::from);
+    let user_home = std::env::var_os("HOME").map(PathBuf::from);
+    discover_homes(executable, candidate_homes(inherited, user_home.as_deref())).await
 }
 
 async fn discover_homes(executable: &str, candidates: Vec<PathBuf>) -> Vec<AccountIdentity> {
     let mut tasks = JoinSet::new();
     let mut accounts = Vec::with_capacity(candidates.len());
-
-    for home in candidates {
-        // Each task starts a process. Keep discovery responsive without launching
-        // an app-server for every home simultaneously.
-        if tasks.len() == MAX_CONCURRENT_DISCOVERIES
-            && let Some(Ok(account)) = tasks.join_next().await
+    let mut candidates = candidates.into_iter();
+    loop {
+        while tasks.len() < MAX_CONCURRENT_DISCOVERIES
+            && let Some(home) = candidates.next()
         {
-            accounts.push(account);
+            tasks.spawn(AccountIdentity::discover(executable.to_owned(), home));
         }
-        let executable = executable.to_owned();
-        tasks.spawn(async move {
-            let fallback = AccountIdentity {
-                codex_home: home.to_string_lossy().into_owned(),
-                email: None,
-                plan_type: None,
-                signed_in: false,
-            };
-            AppServerClient::new(executable, home)
-                .fetch_identity()
-                .await
-                .unwrap_or(fallback)
-        });
-    }
-
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(account) = result {
-            accounts.push(account);
+        match tasks.join_next().await {
+            Some(Ok(account)) => accounts.push(account),
+            Some(Err(error)) => log::warn!("Account discovery task failed: {error}"),
+            None => break,
         }
     }
     accounts.sort_by(|left, right| left.codex_home.cmp(&right.codex_home));
     accounts
 }
 
-pub fn candidate_homes() -> Vec<PathBuf> {
-    let inherited = std::env::var_os("CODEX_HOME").map(PathBuf::from);
-    let user_home = std::env::var_os("HOME").map(PathBuf::from);
-    candidate_homes_from(inherited, user_home.as_deref())
-}
-
-fn candidate_homes_from(inherited: Option<PathBuf>, user_home: Option<&Path>) -> Vec<PathBuf> {
-    let mut candidates = BTreeSet::new();
-
-    if let Some(home) = inherited {
-        insert_candidate(&mut candidates, home, false);
-    }
-
-    let Some(user_home) = user_home else {
-        return candidates.into_iter().collect();
-    };
-
-    insert_candidate(&mut candidates, user_home.join(".codex"), false);
-
-    if let Ok(entries) = std::fs::read_dir(user_home) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            if name.to_string_lossy().starts_with(".codex") {
-                insert_candidate(&mut candidates, entry.path(), true);
-            }
+fn candidate_homes(inherited: Option<PathBuf>, user_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<_> = inherited.into_iter().collect();
+    if let Some(home) = user_home {
+        paths.push(home.join(".codex"));
+        if let Ok(entries) = home.read_dir() {
+            paths.extend(entries.flatten().filter_map(|entry| {
+                let path = entry.path();
+                let is_codex = entry.file_name().to_string_lossy().starts_with(".codex");
+                (is_codex
+                    && (path.join("auth.json").is_file() || path.join("config.toml").is_file()))
+                .then_some(path)
+            }));
         }
     }
-
-    candidates.into_iter().collect()
-}
-
-fn insert_candidate(candidates: &mut BTreeSet<PathBuf>, path: PathBuf, require_state: bool) {
-    if !path.is_dir() {
-        return;
-    }
-    if require_state && !has_codex_state(&path) {
-        return;
-    }
-
-    if let Ok(canonical) = path.canonicalize() {
-        candidates.insert(canonical);
-    }
-}
-
-fn has_codex_state(path: &Path) -> bool {
-    path.join("auth.json").is_file() || path.join("config.toml").is_file()
+    paths
+        .into_iter()
+        .filter_map(|path| canonical_home(&path).ok())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
+    use std::fs;
+    use std::os::unix::fs::symlink;
+    use std::time::Duration;
 
     use super::*;
+    use crate::app_server::FAKE_CODEX;
 
     #[tokio::test]
-    async fn limits_concurrent_processes_and_returns_every_home_in_order() {
+    async fn discovers_every_home_in_order_with_bounded_parallelism() {
         let directory = tempfile::tempdir().unwrap();
-        let executable = directory.path().join("fake-codex");
-        std::fs::write(
-            &executable,
-            r#"#!/bin/sh
-printf 'start\n' >> "$CODEX_HOME/../events"
-IFS= read -r initialize
-printf '%s\n' '{"id":0,"result":{}}'
-IFS= read -r initialized
-IFS= read -r request
-sleep 0.05
-printf 'end\n' >> "$CODEX_HOME/../events"
-printf '%s\n' '{"id":3,"result":{"account":{"planType":"plus"}}}'
-"#,
-        )
-        .unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let homes: Vec<_> = (0..9)
             .rev()
-            .map(|index| {
-                let home = directory.path().join(format!("home-{index}"));
-                std::fs::create_dir(&home).unwrap();
+            .map(|i| {
+                let home = directory.path().join(format!("home-{i}"));
+                fs::create_dir(&home).unwrap();
+                symlink(directory.path(), home.join("discovery")).unwrap();
                 home
             })
             .collect();
+        let events = directory.path().join("events");
+        fs::write(&events, "").unwrap();
+        let hold = directory.path().join("hold");
+        fs::write(&hold, "").unwrap();
 
-        let accounts = discover_homes(executable.to_str().unwrap(), homes.clone()).await;
-        assert_eq!(accounts.len(), homes.len());
-        assert!(
-            accounts
-                .iter()
-                .all(|account| account.plan_type.as_deref() == Some("plus"))
-        );
-        let mut expected: Vec<_> = homes
+        let discovery = tokio::spawn(discover_homes(FAKE_CODEX, homes.clone()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while fs::read_to_string(&events).unwrap().lines().count() < MAX_CONCURRENT_DISCOVERIES
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first group of accounts should be queried concurrently");
+        fs::remove_file(hold).unwrap();
+        let accounts = discovery.await.unwrap();
+        let expected = homes
             .iter()
-            .map(|home| home.to_string_lossy().into_owned())
-            .collect();
-        expected.sort();
+            .rev()
+            .map(|home| home.display().to_string())
+            .collect::<Vec<_>>();
         assert_eq!(
             accounts
                 .iter()
-                .map(|account| account.codex_home.clone())
+                .map(|account| account.codex_home.as_str())
                 .collect::<Vec<_>>(),
             expected
         );
+        assert!(accounts.iter().all(|account| account.signed_in
+            && account.email.as_deref() == Some("test@example.com")
+            && account.plan_type.as_deref() == Some("plus")));
 
-        let events = std::fs::read_to_string(directory.path().join("events")).unwrap();
-        let mut active = 0;
-        let mut peak = 0;
-        for event in events.lines() {
+        let mut active: usize = 0;
+        for event in fs::read_to_string(events).unwrap().lines() {
             match event {
                 "start" => active += 1,
                 "end" => active -= 1,
-                _ => panic!("unexpected event: {event}"),
+                other => panic!("unexpected event {other}"),
             }
-            peak = peak.max(active);
-            assert!((0..=MAX_CONCURRENT_DISCOVERIES as i32).contains(&active));
+            assert!(active <= MAX_CONCURRENT_DISCOVERIES);
         }
         assert_eq!(active, 0);
-        assert!(peak > 1, "discovery should still run in parallel");
-
-        let fallback = discover_homes("/definitely/missing/codex", homes).await;
-        assert_eq!(fallback.len(), expected.len());
-        assert!(
-            fallback
-                .iter()
-                .all(|account| !account.signed_in && account.email.is_none())
-        );
     }
 
-    #[test]
-    fn state_detection_does_not_open_credentials() {
+    #[tokio::test]
+    async fn unavailable_identity_still_offers_the_home() {
         let directory = tempfile::tempdir().unwrap();
-        assert!(!has_codex_state(directory.path()));
-        std::fs::write(directory.path().join("config.toml"), "").unwrap();
-        assert!(has_codex_state(directory.path()));
+        let accounts =
+            discover_homes("/definitely/missing/codex", vec![directory.path().into()]).await;
+        assert_eq!(
+            serde_json::to_value(accounts).unwrap(),
+            serde_json::json!([{
+                "codexHome": directory.path(),
+                "email": null,
+                "planType": null,
+                "signedIn": false
+            }])
+        );
     }
 
     #[test]
-    fn canonicalizes_and_deduplicates_discovered_homes() {
-        let user_home = tempfile::tempdir().unwrap();
-        let default_home = user_home.path().join(".codex");
-        let team_home = user_home.path().join(".codex_team");
-        std::fs::create_dir(&default_home).unwrap();
-        std::fs::create_dir(&team_home).unwrap();
-        std::fs::write(team_home.join("config.toml"), "").unwrap();
-        symlink(&default_home, user_home.path().join(".codex_alias")).unwrap();
-
-        let homes = candidate_homes_from(
-            Some(user_home.path().join(".codex_alias")),
-            Some(user_home.path()),
-        );
-
-        assert_eq!(
-            homes,
-            vec![
-                default_home.canonicalize().unwrap(),
-                team_home.canonicalize().unwrap()
-            ]
-        );
+    fn includes_explicit_homes_and_only_stateful_neighbors_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path();
+        for name in [
+            ".codex",
+            ".codex_team",
+            ".codex_personal",
+            ".codex_empty",
+            "unrelated",
+            "inherited",
+        ] {
+            fs::create_dir(home.join(name)).unwrap();
+        }
+        fs::write(home.join(".codex_team/config.toml"), "").unwrap();
+        fs::write(home.join(".codex_personal/auth.json"), "unparseable").unwrap();
+        fs::write(home.join("unrelated/auth.json"), "").unwrap();
+        symlink(home.join(".codex_team"), home.join(".codex_alias")).unwrap();
+        let homes = candidate_homes(Some(home.join("inherited")), Some(home));
+        let expected = [".codex", ".codex_personal", ".codex_team", "inherited"]
+            .map(|name| home.join(name).canonicalize().unwrap());
+        assert_eq!(homes, expected);
     }
 }
